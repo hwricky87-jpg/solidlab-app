@@ -198,24 +198,28 @@
   const clean = (q) => q.map((v) => Number(v.toFixed(6)));
   // Snap order: existing point › crossing of two lines › midpoint of a side › on a side › grid.
   // This is what makes auxiliary lines (diagonals, heights, lines through midpoints) easy to draw.
+  // Fingers are less precise than a mouse, so touch snaps from farther away.
+  let reach = 1;
   function snapAt(p, free, except) {
     let best = null;
-    for (const pt of doc.points) { if (pt.id === except) continue; const d = dist(toS(pt.at), p); if (d < 11 && (!best || d < best.d)) best = { id: pt.id, at: pt.at, d }; }
+    for (const pt of doc.points) { if (pt.id === except) continue; const d = dist(toS(pt.at), p); if (d < 11 * reach && (!best || d < best.d)) best = { id: pt.id, at: pt.at, d }; }
     if (best) return best;
-    const m = toM(p);
+    const m = toM(p), near = 14 * reach;
     if (!free) {
       // Only edges passing near the pointer can give a crossing or a snap, which keeps this cheap.
-      const list = edges().filter((e) => dist(toS(onEdge(e, m)), p) < 12), consider = (q, kind, radius) => { const d = dist(toS(q), p); if (d < radius && (!best || d < best.d)) best = { at: clean(q), kind, d }; };
-      for (let i = 0; i < list.length; i++) for (let j = i + 1; j < list.length; j++) { const q = crossing(list[i], list[j]); if (q) consider(q, '교점', 11); }
+      const list = edges().filter((e) => dist(toS(onEdge(e, m)), p) < near * 1.6), consider = (q, kind, radius) => { const d = dist(toS(q), p); if (d < radius && (!best || d < best.d)) best = { at: clean(q), kind, d }; };
+      for (let i = 0; i < list.length; i++) for (let j = i + 1; j < list.length; j++) { const q = crossing(list[i], list[j]); if (q) consider(q, '교점', 11 * reach); }
       if (best) return best;
-      for (const e of list) if (e.kind === 'segment') consider([(e.a[0] + e.b[0]) / 2, (e.a[1] + e.b[1]) / 2], '중점', 10);
+      for (const e of list) if (e.kind === 'segment') consider([(e.a[0] + e.b[0]) / 2, (e.a[1] + e.b[1]) / 2], '중점', 10 * reach);
       if (best) return best;
       const step = prefs.snap;
-      // On a side: prefer the grid crossing along it, otherwise the nearest point on it.
+      // Near a side the point always lands on it: at the grid crossing along the side when one is
+      // close, otherwise at the nearest point. It never falls back to a grid point off the side
+      // (such a point can sit on a dimension line drawn beside the side).
       for (const e of list) {
-        const q = onEdge(e, m); if (dist(toS(q), p) >= 7) continue;
-        const g = step > 0 ? m.map((v) => Math.round(v / step) * step) : null;
-        consider(g && dist(onEdge(e, g), g) < 1e-9 && dist(toS(g), p) < 12 ? g : q, '변 위', 7);
+        const q = onEdge(e, m), g = step > 0 ? m.map((v) => Math.round(v / step) * step) : null;
+        const onGrid = g && dist(onEdge(e, g), g) < 1e-9 && dist(toS(g), p) < near;
+        consider(onGrid ? g : q, '변 위', near * 1.6);
       }
       if (best) return best;
     }
@@ -361,6 +365,7 @@
   stage.addEventListener('pointerdown', (e) => {
     stage.focus({ preventScroll: true });
     const p = local(e), touch = e.pointerType === 'touch';
+    reach = touch ? 1.8 : 1;
     if (touch) { touches.set(e.pointerId, p); stage.setPointerCapture(e.pointerId); if (touches.size === 2) { startPinch(); return; } if (touches.size > 2) return; }
     if (e.button === 1 || e.button === 2 || spaceDown) { drag = { kind: 'pan', p, view: { ...view } }; stage.setPointerCapture(e.pointerId); stage.classList.add('panning'); return; }
     if (e.button !== 0) return;
@@ -384,8 +389,10 @@
       if (dist(pt.at, snap.at) > 1e-9) { pt.at = snap.at.map((v) => Number(v.toFixed(6))); drag.moved = true; request(); }
       return;
     }
-    // A finger that slides before lifting pans instead of drawing.
-    if (tap && tap.id === e.pointerId && dist(tap.p, p) > 10) { drag = { kind: 'pan', p: tap.p, view: { ...view } }; tap = null; return; }
+    // A finger slides the snap marker to the exact spot; the point is placed on release.
+    // (Two fingers pan and zoom.)
+    if (tap && tap.id === e.pointerId) { tap.p = p; hover = { snap: snapAt(p, false) }; request(); return; }
+    if (e.pointerType === 'mouse') reach = 1;
     hover = tool === 'select' ? { hit: hitTest(p) } : { snap: snapAt(p, e.shiftKey) };
     request();
   });
