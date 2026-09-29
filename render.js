@@ -568,6 +568,12 @@
       if (dim.behind) warn('dimension-behind', name + '가 가리키는 모서리가 이 시점에서 도형 뒤에 가려져 있어 치수선이 도형 위를 지납니다. 시점을 바꾸거나 다른 모서리를 재세요.', { id: dim.id });
       if (dim.crowded) warn('dimension-overlap', name + '의 선이나 글자가 다른 치수와 겹칩니다. offset을 바꾸거나 한쪽을 숨기세요.', { id: dim.id });
     }
+    // A "?" is pointless if a parallel dimension of the same length prints the answer.
+    const vec = (d) => G.sub(d.b, d.a);
+    for (const q of scene.dims.filter((d) => d.questionMark)) {
+      const qv = vec(q), leak = scene.dims.find((o) => o !== q && !o.questionMark && !o.answer && Math.abs(G.length(vec(o)) - G.length(qv)) < 1e-9 && Math.abs(Math.abs(G.dot(vec(o), qv)) - G.length(qv) ** 2) < 1e-9);
+      if (leak) warn('answer-visible', '문제 치수 ' + q.id + '와 같은 방향·같은 길이의 치수 ' + leak.id + '가 "' + leak.label + '"로 보여 답이 드러납니다. ' + leak.id + '를 숨기거나(visibility … hide) 전체 치수 자체를 문제로 바꾸세요(ask).', { id: q.id, leak: leak.id });
+    }
     const rects = [...scene.dims.map((d) => ({ id: d.id, text: d.label, hit: d.hit })), ...scene.labels.map((l) => ({ id: l.id, text: l.text, hit: l.hit }))];
     for (let i = 0; i < rects.length; i++) for (let j = i + 1; j < rects.length; j++) {
       if (rectsOverlap(rects[i].hit, rects[j].hit)) warn('label-overlap', '"' + rects[i].text + '"와 "' + rects[j].text + '" 글자가 겹칩니다. offset을 바꾸거나 시점을 바꾸세요.', { ids: [rects[i].id, rects[j].id] });

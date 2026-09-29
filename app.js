@@ -140,7 +140,8 @@
   }
 
   function hasUnsavedWork() {
-    return sessionReady && (state.cells.size || state.dimensions.length || state.labels.length) && fileCheckpoint !== documentKey();
+    return sessionReady && fileCheckpoint !== documentKey() &&
+      (fileCheckpoint !== null || state.cells.size || state.dimensions.length || state.labels.length);
   }
 
   // The window asks before closing when either the solid or the 2D diagram has unsaved work.
@@ -191,7 +192,7 @@
 
   function requestProjectAction(action) {
     cancelActivePointer();
-    const unsaved = hasUnsavedWork();
+    const unsaved = hasUnsavedWork() || (action.kind === 'close' && window.SolidDiagramApp?.dirty());
     if (!unsaved) { commitProjectAction(action); return; }
     pendingProjectAction = action;
     const isNew = action.kind === 'new';
@@ -205,7 +206,14 @@
   async function applyPendingProject(saveFirst) {
     const action = pendingProjectAction; if (!action) return;
     try {
-      if (saveFirst && !await saveProjectFile()) return;
+      if (saveFirst) {
+        if ((action.kind !== 'close' || hasUnsavedWork()) && !await saveProjectFile()) return;
+        if (action !== pendingProjectAction) return;
+        if (action.kind === 'close' && window.SolidDiagramApp?.dirty() && !await window.SolidDiagramApp.save()) return;
+        if (action.kind === 'close' && (hasUnsavedWork() || window.SolidDiagramApp?.dirty())) {
+          $('projectChangeError').textContent = '저장 중 바뀐 작업이 있습니다. 다시 저장해 주세요.'; return;
+        }
+      }
       if (action !== pendingProjectAction) return;
       commitProjectAction(action); pendingProjectAction = null; $('projectChangeDialog').close();
     } catch (e) { $('projectChangeError').textContent = e.message; }
@@ -864,6 +872,21 @@
     } catch (err) { $('dimensionError').textContent = err.message; }
   });
   $('cancelDimensionBtn').addEventListener('click', () => $('dimensionDialog').close());
+  $('dimensionLabelOnlyBtn').addEventListener('click', () => {
+    const d = dialogDimension;
+    if (!d) return;
+    const label = $('dimensionLabel').value.trim();
+    if (label.length > 30) { $('dimensionError').textContent = '표시 글자는 30자 이내로 입력해 주세요.'; return; }
+    const meta = { ...(label ? { label } : {}), ...($('dimensionQuestion').checked ? { question: true } : {}) };
+    if (JSON.stringify(meta) !== JSON.stringify(labelMeta(d))) {
+      pushHistory(snapshot());
+      if (d.kind === 'overall') state.overallMeta[d.axis] = meta;
+      else state.dimensions = state.dimensions.map((item) => item.id === d.id ? { ...item, label: meta.label, question: meta.question } : item);
+      rebuild(); scheduleSave();
+    }
+    $('dimensionDialog').close();
+    message('도형 크기는 그대로 두고 표시 글자만 바꿨습니다.');
+  });
 
   $('labelForm').addEventListener('submit', (e) => {
     e.preventDefault();
@@ -904,6 +927,22 @@
     try {
       const saved = await download(new Blob([exportedSvg()], { type: 'image/svg+xml;charset=utf-8' }), exportName('svg'));
       message(saved ? (desktop ? 'SVG 그림을 저장했습니다.' : 'SVG 그림 저장을 요청했습니다.') : '그림 저장을 취소했습니다.');
+    } catch (error) { message(error.message, true); }
+  }
+
+  async function exportSvgPair() {
+    if (!state.cells.size) { message('먼저 도형을 만들어 주세요.'); return; }
+    const data = projectData();
+    if (![...data.dimensions, ...data.overallDimensions].some((d) => d.question && d.visible !== false)) {
+      message('문제로 표시한 치수가 없습니다.', true); return;
+    }
+    try {
+      const options = { geometry, preset: $('exportPreset').value || undefined };
+      const name = '입체도형_' + stamp();
+      const problem = await download(new Blob([R.renderSvg(data, { ...options, answers: false })], { type: 'image/svg+xml;charset=utf-8' }), name + '_문제.svg');
+      if (!problem) { message('저장을 취소했습니다.'); return; }
+      const answer = await download(new Blob([R.renderSvg(data, { ...options, answers: true })], { type: 'image/svg+xml;charset=utf-8' }), name + '_정답.svg');
+      message(answer ? '문제·정답 SVG를 저장했습니다.' : '정답 그림 저장을 취소했습니다.', !answer);
     } catch (error) { message(error.message, true); }
   }
 
@@ -1033,9 +1072,9 @@
     }
     finally { $('fileInput').value = ''; }
   });
-  $('exportSvgBtn').addEventListener('click', exportSvg); $('exportPngBtn').addEventListener('click', exportPng); $('copySvgBtn').addEventListener('click', copySvg);
+  $('exportSvgBtn').addEventListener('click', exportSvg); $('exportPngBtn').addEventListener('click', exportPng); $('exportPairBtn').addEventListener('click', exportSvgPair); $('copySvgBtn').addEventListener('click', copySvg);
   const toolFolder = desktop ? '설치 폴더의 resources\\app.asar.unpacked (보통 %LOCALAPPDATA%\\Programs\\SolidLab\\resources\\app.asar.unpacked)' : '이 앱 폴더';
-  const aiPrompt = '첨부한 입체도형 JSON을 읽고 실제 크기, 치수선별 길이와 숨김 상태를 확인해 줘. 수정 요청이 있으면 원본은 보존하고 새 JSON 파일로 만들어 줘.\n\nSolidLab 도구는 ' + toolFolder + '에 있어. 그 폴더의 AI_도형_연동.md를 먼저 읽고 node model-tools.cjs를 써. 순서는 inspect → 수정 → check(경고 확인) → views(앞·옆·위 모양 확인) → render.\n\n그림은 node model-tools.cjs render "도형.json" "확인.png"로 PNG를 만들어 직접 눈으로 확인하고, 학습지에 넣을 SVG는 --preset worksheet로 만들어. 실제 길이는 칸 수 × unit이야. 치수 숫자 대신 실제 형상을 고치고, 요청하지 않은 숨김·격자 설정은 유지해.';
+  const aiPrompt = '첨부한 입체도형 JSON을 읽고 실제 크기, 치수선별 길이와 숨김 상태를 확인해 줘. 수정 요청이 있으면 원본은 보존하고 새 JSON 파일로 만들어 줘.\n\nSolidLab 도구는 ' + toolFolder + '에 있어. 그 폴더의 AI_도형_연동.md를 먼저 읽고 node model-tools.cjs를 써. 순서는 inspect → 수정 → check(경고 확인) → views(앞·옆·위 모양 확인) → render. 길이를 묻는 문제는 ask로 그 치수를 "?"로 바꾸고, sheet 명령으로 확인 PNG와 문제·정답 SVG를 한 번에 만들 수 있어.\n\n그림은 node model-tools.cjs render "도형.json" "확인.png"로 PNG를 만들어 직접 눈으로 확인하고, 학습지에 넣을 SVG는 --preset worksheet로 만들어. 실제 길이는 칸 수 × unit이야. 치수 숫자 대신 실제 형상을 고치고, 요청하지 않은 숨김·격자 설정은 유지해.';
   $('aiHelpBtn').addEventListener('click', () => { $('aiPrompt').value = aiPrompt; $('aiCopyStatus').textContent = ''; $('aiDialog').showModal(); });
   $('closeAiBtn').addEventListener('click', () => $('aiDialog').close());
   $('copyAiPromptBtn').addEventListener('click', async () => {
@@ -1076,7 +1115,6 @@
     const modal = document.querySelector('dialog[open]');
     // Closing the window always works: a small open dialog is dismissed first.
     if (command === 'close') {
-      if (window.SolidDiagramApp?.dirty() && !window.confirm('저장하지 않은 평면 그림이 있습니다. 그래도 닫을까요?')) return;
       if (modal && !['startupDialog', 'projectChangeDialog'].includes(modal.id)) modal.close(); requestProjectAction({ kind: 'close' }); return;
     }
     if (diagramMode() && !modal) { window.SolidDiagramApp.command(command); return; }
@@ -1094,6 +1132,36 @@
     const ratio = Math.min(2, window.devicePixelRatio || 1); canvas.width = Math.round(width * ratio); canvas.height = Math.round(height * ratio); ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
     if (state.view.autoFit) fitView(); else requestRender();
   });
+  function initReference(prefix, imageId) {
+    const image = $(imageId), fileInput = $(prefix + 'ReferenceFile');
+    let url = null;
+    const update = () => {
+      const scale = Math.min(500, Math.max(10, Number($(prefix + 'ReferenceScale').value) || 100));
+      const x = Number($(prefix + 'ReferenceX').value) || 0;
+      const y = Number($(prefix + 'ReferenceY').value) || 0;
+      image.style.opacity = String((Number($(prefix + 'ReferenceOpacity').value) || 45) / 100);
+      image.style.transform = `translate(${x}px, ${y}px) scale(${scale / 100})`;
+    };
+    $(prefix + 'ReferenceOpen').addEventListener('click', () => fileInput.click());
+    $(prefix + 'ReferenceClear').addEventListener('click', () => {
+      image.removeAttribute('src'); image.style.display = 'none';
+      if (url) URL.revokeObjectURL(url);
+      url = null; fileInput.value = '';
+    });
+    fileInput.addEventListener('change', () => {
+      const file = fileInput.files?.[0];
+      if (!file) return;
+      if (!file.type.startsWith('image/')) { message('이미지 파일을 골라 주세요.', true); return; }
+      const nextUrl = URL.createObjectURL(file);
+      image.onload = () => { if (url) URL.revokeObjectURL(url); url = nextUrl; image.style.display = 'block'; update(); };
+      image.onerror = () => { URL.revokeObjectURL(nextUrl); message('이미지를 열지 못했습니다.', true); };
+      image.src = nextUrl;
+    });
+    for (const key of ['Opacity', 'Scale', 'X', 'Y']) $(prefix + 'Reference' + key).addEventListener('input', update);
+    window.addEventListener('beforeunload', () => { if (url) URL.revokeObjectURL(url); });
+  }
+  initReference('solid', 'solidReference');
+  initReference('diagram', 'diagramReference');
   window.SolidLabShell = { desktop, message, download, updateDirty: updateDesktopDirty };
   resizeObserver.observe($('canvasWrap')); syncControls(); rebuild(); updateHistory(); updateBrushControls(); setTool('orbit'); prepareStartup();
 })();

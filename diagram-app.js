@@ -32,7 +32,7 @@
   const blank = () => ({ format: 'solidlab-diagram', version: 1, unit: 1, unitLabel: 'cm', grid: false, settings: { style: 'print' }, points: [], items: [] });
   let doc = blank(), history = [], future = [], checkpoint = JSON.stringify(doc);
   let view = { cx: 5, cy: 4, k: 40 }, W = 0, H = 0, scene = null, toS = null, toM = null;
-  let tool = 'segment', pending = [], hover = null, selection = null, drag = null, spaceDown = false, saveTimer = null, queued = false;
+  let tool = 'segment', pending = [], hover = null, selection = null, drag = null, spaceDown = false, saveTimer = null, queued = false, saveBusy = false;
   const prefs = (() => { try { return { snap: 1, naming: '', ...JSON.parse(localStorage.getItem(PREFS) || '{}') }; } catch { return { snap: 1, naming: '' }; } })();
 
   const active = () => document.body.dataset.mode === 'diagram';
@@ -63,7 +63,7 @@
   }
   function updateHistory() { $('dgUndoBtn').disabled = !history.length; $('dgRedoBtn').disabled = !future.length; }
   const empty = () => !doc.points.length && !doc.items.length;
-  function dirty() { return !empty() && JSON.stringify(doc) !== checkpoint; }
+  function dirty() { return JSON.stringify(doc) !== checkpoint; }
 
   function nextId() { let n = doc.points.length + 1; while (pointById('P' + n)) n++; return 'P' + n; }
   function nextName() {
@@ -538,11 +538,15 @@
     const url = URL.createObjectURL(blob), a = Object.assign(document.createElement('a'), { href: url, download: name }); document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 15000); return true;
   }
   async function save() {
+    if (saveBusy) return false;
+    saveBusy = true; $('dgSaveBtn').disabled = true;
     try {
+      const savedCheckpoint = JSON.stringify(doc);
       const text = JSON.stringify(doc, null, 2) + '\n';
-      if (await download(new Blob([text], { type: 'application/json' }), '평면그림_' + stamp() + '.json')) { checkpoint = JSON.stringify(doc); changed(); message('평면 그림 파일을 저장했습니다.'); return true; }
+      if (await download(new Blob([text], { type: 'application/json' }), '평면그림_' + stamp() + '.json')) { checkpoint = savedCheckpoint; changed(); message('평면 그림 파일을 저장했습니다.'); return true; }
       message('저장을 취소했습니다.'); return false;
     } catch (error) { message(error.message, true); return false; }
+    finally { saveBusy = false; $('dgSaveBtn').disabled = false; }
   }
   function load(data) {
     try { D.validate(data); } catch (error) { message(error.message, true); return false; }
@@ -561,6 +565,18 @@
     load(result.data);
   }
   function exportSvg() { return D.renderSvg(doc, { preset: $('dgPreset').value || undefined, answers: $('dgAnswers').checked, title: '평면 그림' }); }
+  async function saveSvgPair() {
+    if (empty()) { message('먼저 그림을 그려 주세요.'); return; }
+    if (!doc.items.some((it) => it.question === true)) { message('문제로 표시한 치수가 없습니다.', true); return; }
+    try {
+      const options = { preset: $('dgPreset').value || undefined, title: '평면 그림' };
+      const name = '평면그림_' + stamp();
+      const problem = await download(new Blob([D.renderSvg(doc, { ...options, answers: false })], { type: 'image/svg+xml;charset=utf-8' }), name + '_문제.svg');
+      if (!problem) { message('저장을 취소했습니다.'); return; }
+      const answer = await download(new Blob([D.renderSvg(doc, { ...options, answers: true })], { type: 'image/svg+xml;charset=utf-8' }), name + '_정답.svg');
+      message(answer ? '문제·정답 SVG를 저장했습니다.' : '정답 그림 저장을 취소했습니다.');
+    } catch (error) { message(error.message, true); }
+  }
   function svgToPng(svg, scale) {
     return new Promise((resolve, reject) => {
       const url = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml;charset=utf-8' })), image = new Image();
@@ -729,7 +745,7 @@
   document.querySelectorAll('[data-dtool]').forEach((el) => el.addEventListener('click', () => setTool(el.dataset.dtool)));
   $('dgUndoBtn').addEventListener('click', () => undo(-1)); $('dgRedoBtn').addEventListener('click', () => undo(1));
   $('dgNewBtn').addEventListener('click', newDiagram); $('dgLoadBtn').addEventListener('click', open); $('dgSaveBtn').addEventListener('click', save);
-  $('dgSvgBtn').addEventListener('click', () => saveImage('svg')); $('dgPngBtn').addEventListener('click', () => saveImage('png')); $('dgCopyBtn').addEventListener('click', copySvg);
+  $('dgSvgBtn').addEventListener('click', () => saveImage('svg')); $('dgPngBtn').addEventListener('click', () => saveImage('png')); $('dgPairBtn').addEventListener('click', saveSvgPair); $('dgCopyBtn').addEventListener('click', copySvg);
   $('dgFitBtn').addEventListener('click', fit); $('dgZoomIn').addEventListener('click', () => zoom(1.25)); $('dgZoomOut').addEventListener('click', () => zoom(.8));
   $('dgDemoTriangle').addEventListener('click', () => demo('triangle')); $('dgDemoCircle').addEventListener('click', () => demo('circle'));
   $('dgAnswers').addEventListener('change', request);
@@ -778,7 +794,7 @@
     const saved = JSON.parse(localStorage.getItem(STORAGE) || 'null');
     if (saved?.doc) { D.validate(saved.doc); doc = saved.doc; checkpoint = saved.clean ? JSON.stringify(doc) : JSON.stringify(blank()); }
   } catch {}
-  window.SolidDiagramApp = { load, command, setMode, dirty, snapshot: () => clone(doc) };
+  window.SolidDiagramApp = { load, command, setMode, dirty, save, snapshot: () => clone(doc) };
   setTool('segment'); changed();
   if (localStorage.getItem(MODE_KEY) === 'diagram') { setMode('diagram'); requestAnimationFrame(fit); }
 })();
