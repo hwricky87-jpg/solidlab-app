@@ -15,12 +15,13 @@
     parallel: '점을 누른 뒤 변을 누르면, 그 점을 지나고 변과 평행한 선분을 긋습니다.',
     polygon: '꼭짓점을 차례로 누르고, 첫 점을 다시 누르거나 Enter로 닫습니다.',
     circle: '중심을 누른 뒤 원 위의 한 곳을 누릅니다.\n이미 있는 점을 누르면 그 점을 지나는 원이 됩니다.',
+    ellipse: '긴 지름의 두 끝을 차례로 누릅니다. 원기둥·원뿔의 밑면처럼 비스듬히 본 원이 돼요.\n납작한 정도와 위쪽 절반 점선은 오른쪽에서 바꿉니다.',
     arc: '중심 → 시작점 → 끝점 순서로 누릅니다.\n시계 반대 방향으로 그려요.',
     angle: '한 변 위의 점 → 꼭짓점 → 다른 변 위의 점 순서로 누릅니다.\n90°면 직각 표시가 됩니다.',
     dim: '길이를 잴 두 점을 누릅니다.',
     text: '글자를 넣을 곳을 누릅니다.'
   };
-  const STEPS = { segment: 2, dim: 2, circle: 2, arc: 3, angle: 3 };
+  const STEPS = { segment: 2, dim: 2, circle: 2, ellipse: 2, arc: 3, angle: 3 };
   // Edge picked by a click, for the perpendicular and parallel tools.
   function edgeAt(p) {
     let best = null;
@@ -139,6 +140,7 @@
     if (['segment', 'line', 'ray', 'dim'].includes(it.type)) return { kind: it.type === 'segment' || it.type === 'dim' ? 'seg' : it.type, pts: [P(it.a), P(it.b)] };
     if (it.type === 'polygon') return { kind: 'poly', pts: it.points.map(P), fill: it.fill === 'light' };
     if (it.type === 'circle') { const c = P(it.center), r = (it.r ?? dist(at(it.center), at(it.through))) * view.k; return { kind: 'circle', c, r, fill: it.fill === 'light' }; }
+    if (it.type === 'ellipse') { const e = D.ellipse(at(it.from), at(it.to), it.ratio); return { kind: 'poly', pts: Array.from({ length: 48 }, (_, j) => toS(D.ellipsePoint(e, j * Math.PI / 24))) }; }
     if (it.type === 'arc' || it.type === 'sector') {
       const c = at(it.center), a = at(it.from), b = at(it.to);
       const a0 = Math.atan2(a[1] - c[1], a[0] - c[0]), a1 = Math.atan2(b[1] - c[1], b[0] - c[0]);
@@ -262,6 +264,10 @@
     if (placed.length && cursor) {
       const line = (a, b) => '<line x1="' + a[0] + '" y1="' + a[1] + '" x2="' + b[0] + '" y2="' + b[1] + '" stroke="' + accent + '" stroke-width="1.3" stroke-dasharray="5 4"/>';
       if (tool === 'circle') svg.push('<circle cx="' + placed[0][0] + '" cy="' + placed[0][1] + '" r="' + dist(placed[0], cursor) + '" fill="none" stroke="' + accent + '" stroke-width="1.3" stroke-dasharray="5 4"/>');
+      else if (tool === 'ellipse') {
+        const c = [(placed[0][0] + cursor[0]) / 2, (placed[0][1] + cursor[1]) / 2], rx = dist(placed[0], cursor) / 2, deg = Math.atan2(cursor[1] - placed[0][1], cursor[0] - placed[0][0]) * 180 / Math.PI;
+        svg.push('<ellipse cx="' + c[0] + '" cy="' + c[1] + '" rx="' + rx + '" ry="' + rx * .3 + '" transform="rotate(' + deg + ' ' + c[0] + ' ' + c[1] + ')" fill="none" stroke="' + accent + '" stroke-width="1.3" stroke-dasharray="5 4"/>');
+      }
       else if (tool === 'arc') { svg.push(line(placed[0], placed.length > 1 ? placed[1] : cursor)); if (placed.length > 1) svg.push(line(placed[0], cursor)); }
       else { placed.forEach((q, i) => { if (i) svg.push(line(placed[i - 1], q)); }); svg.push(line(placed[placed.length - 1], cursor)); }
     }
@@ -316,6 +322,10 @@
       else if (tool === 'circle') {
         const center = ensurePoint(snaps[0]);
         item = snaps[1].id ? { type: 'circle', center, through: snaps[1].id } : { type: 'circle', center, r: Number(dist(snaps[0].at, snaps[1].at).toFixed(6)) };
+      } else if (tool === 'ellipse') {
+        // New ends of the long axis get no dot; the outline already shows where they are.
+        const end = (s) => { const id = ensurePoint(s); if (!s.id) pointById(id).show = false; return id; };
+        item = { type: 'ellipse', from: end(snaps[0]), to: end(snaps[1]) };
       } else if (tool === 'arc') item = { type: 'arc', center: ensurePoint(snaps[0]), from: ensurePoint(snaps[1]), to: ensurePoint(snaps[2]) };
       else if (tool === 'angle') {
         const [f, v, t] = snaps.map((s) => s.at), u = [f[0] - v[0], f[1] - v[1]], w = [t[0] - v[0], t[1] - v[1]];
@@ -432,6 +442,7 @@
     const list = doc.points.map((p) => p.at);
     for (const it of doc.items) {
       if (it.type === 'circle') { const c = at(it.center), r = it.r ?? dist(c, at(it.through)); list.push([c[0] - r, c[1] - r], [c[0] + r, c[1] + r]); }
+      else if (it.type === 'ellipse') { const e = D.ellipse(at(it.from), at(it.to), it.ratio); list.push(D.ellipsePoint(e, Math.PI / 2), D.ellipsePoint(e, -Math.PI / 2)); }
       else if (it.type === 'arc' || it.type === 'sector') { const c = at(it.center), r = dist(c, at(it.from)); list.push([c[0] - r, c[1] - r], [c[0] + r, c[1] + r]); }
       else if (it.type === 'text' && Array.isArray(it.at)) list.push(it.at);
     }
@@ -509,6 +520,12 @@
         parts.push(toggle('안쪽 색칠', it.fill === 'light', (v) => set(it, 'fill', 'light', !v)));
         const r = it.r ?? dist(A(it.center), A(it.through));
         parts.push(info('반지름 ' + unitText(r) + ' · 지름 ' + unitText(2 * r)));
+      } else if (it.type === 'ellipse') {
+        parts.push(field('납작한 정도 (짧은 지름 ÷ 긴 지름)', numberInput(it.ratio ?? .3, (v) => v > 0 && v <= 1 ? set(it, 'ratio', v, v === .3) : updateProps())));
+        parts.push(field('위쪽 절반 (뒤쪽)', select([['solid', '실선'], ['dash', '점선 (가려진 부분)'], ['hide', '그리지 않음']], it.back || 'solid', (v) => set(it, 'back', v, v === 'solid'))));
+        parts.push(toggle('안쪽 색칠', it.fill === 'light', (v) => set(it, 'fill', 'light', !v)));
+        const d = dist(A(it.from), A(it.to));
+        parts.push(info('긴 지름 ' + unitText(d) + ' · 반지름 ' + unitText(d / 2) + '\n원기둥 아래 밑면, 원뿔 밑면, 구의 가운데 둘레는 위쪽 절반을 점선으로 그려요.'));
       } else if (it.type === 'arc' || it.type === 'sector') {
         parts.push(field('종류', select([['arc', '호'], ['sector', '부채꼴']], it.type, (v) => commit(() => { it.type = v; if (v === 'arc') delete it.fill; }))));
         parts.push(toggle('시계 반대 방향', it.ccw !== false, (v) => set(it, 'ccw', false, v)));
@@ -677,7 +694,12 @@
     sector: { params: [['반지름', 3], ['중심각 (°)', 90]], build: ([r, t]) => {
       if (!(t > 0 && t < 360)) throw new Error('중심각은 0°보다 크고 360°보다 작아야 합니다.');
       return { sector: [r, t] };
-    } }
+    } },
+    // Round solids are drawn as textbook pictures with ellipses (diagram.js curved).
+    cylinder: { params: [['반지름', 2], ['높이', 4]], build: ([r, h]) => ({ round: ['cylinder', r, h] }) },
+    cone: { params: [['반지름', 2], ['높이', 3]], build: ([r, h]) => ({ round: ['cone', r, h] }) },
+    sphere: { params: [['반지름', 2]], build: ([r]) => ({ round: ['sphere', r] }) },
+    hemisphere: { params: [['반지름', 2]], build: ([r]) => ({ round: ['hemisphere', r] }) }
   };
   const isCount = (label) => /°|수/.test(label);
   function shapeParams() {
@@ -697,19 +719,39 @@
         if (!(Number.isFinite(v) && v > 0 && v <= 10000)) throw new Error(label + '에 0보다 큰 수를 넣어 주세요.');
         return isCount(label) ? v : v / doc.unit; // lengths become grid units
       });
-      const spec = shape.build(values), r0 = spec.circle ?? spec.sector?.[0];
-      const all = spec.pts || [[-r0, -r0], [r0, r0]];
+      const spec = shape.build(values), r0 = spec.circle ?? spec.sector?.[0], solid = spec.round && D.curved(...spec.round);
+      const all = spec.pts || solid?.box || [[-r0, -r0], [r0, r0]];
       // Place to the right of what is already drawn, on the same baseline.
       const minX = Math.min(...all.map((p) => p[0])), minY = Math.min(...all.map((p) => p[1]));
       let dx = -minX, dy = -minY;
-      if (doc.points.length) { dx = Math.max(...doc.points.map((p) => p.at[0])) + 2 - minX; dy = Math.min(...doc.points.map((p) => p.at[1])) - minY; }
+      if (doc.points.length) {
+        // Beside the drawing with the bottoms level; round shapes reach past their points.
+        let box = null; try { box = D.extent(doc); } catch {}
+        box = box || { x1: Math.max(...doc.points.map((p) => p.at[0])), y0: Math.min(...doc.points.map((p) => p.at[1])) };
+        dx = box.x1 + 3 - minX; dy = box.y0 - minY; // room for a dimension on the right of the last shape
+      }
       const move = (p) => [Number((p[0] + dx).toFixed(6)), Number((p[1] + dy).toFixed(6))];
       commit(() => {
         // Corners are drawn by the lines; names follow the "새 점 이름" setting.
         const corner = (p) => { const id = ensurePoint({ at: move(p) }); pointById(id).show = false; return id; };
         const hidden = (p) => { const id = nextId(); doc.points.push({ id, at: move(p), show: false }); return id; };
         const items = doc.items;
-        if (spec.pts) {
+        if (solid) {
+          // Fresh point ids with every reference rewritten; the shown centre takes the next name.
+          const ids = {}, start = doc.points.length;
+          for (const p of solid.points) { ids[p.id] = nextId(); doc.points.push({ ...p, id: ids[p.id] }); }
+          for (const p of doc.points.slice(start)) {
+            if (p.at) p.at = move(p.at);
+            if (p.on) p.on = p.on.map((r) => ids[r]);
+            const name = p.show === false ? undefined : nextName();
+            if (name) p.label = name;
+          }
+          for (const { id, ...it } of solid.items) {
+            if (it.type === 'dim' && !withDims) continue;
+            for (const k of ['a', 'b', 'center', 'through', 'from', 'to', 'at']) if (typeof it[k] === 'string') it[k] = ids[it[k]];
+            items.push(it);
+          }
+        } else if (spec.pts) {
           const ids = spec.pts.map(corner), n = ids.length;
           items.push({ type: 'polygon', points: ids });
           if (spec.ticks || spec.ticksAll) ids.forEach((id, i) => items.push({ type: 'segment', a: id, b: ids[(i + 1) % n], ticks: 1 }));
@@ -800,7 +842,7 @@
     if (e.key === 'Escape') { pending = []; selection = null; hint(''); changed(); return; }
     if (e.key === 'Enter') { finishPolygon(); return; }
     if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); deleteSelection(); return; }
-    const tools = { v: 'select', p: 'point', l: 'segment', g: 'polygon', c: 'circle', r: 'arc', n: 'angle', d: 'dim', t: 'text', h: 'perp', k: 'parallel' };
+    const tools = { v: 'select', p: 'point', l: 'segment', g: 'polygon', c: 'circle', e: 'ellipse', r: 'arc', n: 'angle', d: 'dim', t: 'text', h: 'perp', k: 'parallel' };
     if (tools[key]) setTool(tools[key]);
   });
   document.addEventListener('keyup', (e) => { if (e.code === 'Space') spaceDown = false; });

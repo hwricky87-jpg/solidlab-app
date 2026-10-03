@@ -26,6 +26,16 @@
     if (item.question !== undefined && typeof item.question !== 'boolean') fail(where + '.question은 true/false여야 합니다.');
   };
 
+  // A circle seen at a slant (the base of a cylinder or cone, the equator of a sphere): from/to are
+  // the ends of the long axis and ratio is short ÷ long. n points to the back half, the one above
+  // the long axis (left of it when the axis is vertical). Angle t: 0 = "to", π/2 = back, π = "from".
+  function ellipse(a, b, ratio = .3) {
+    const u = unit(minus(b, a)), left = [-u[1], u[0]];
+    const n = left[1] > 1e-12 || (Math.abs(left[1]) <= 1e-12 && left[0] < 0) ? left : mul(left, -1);
+    return { c: mul(add(a, b), .5), rx: dist(a, b) / 2, ry: dist(a, b) / 2 * ratio, u, n };
+  }
+  const onEllipse = (e, t) => add(e.c, add(mul(e.u, e.rx * Math.cos(t)), mul(e.n, e.ry * Math.sin(t))));
+
   // Where lines AB and CD meet (they need not be drawn that far), or null when parallel.
   function meet(a, b, c, d) {
     const r = minus(b, a), s = minus(d, c), den = cross(r, s);
@@ -123,13 +133,18 @@
           refs(ids, it.from, w + '.from'); refs(ids, it.to, w + '.to');
           if (it.from === it.center || it.to === it.center || it.from === it.to) fail(w + '의 중심과 두 끝점은 서로 달라야 합니다.');
         }
+      } else if (it.type === 'ellipse') {
+        refs(ids, it.from, w + '.from'); refs(ids, it.to, w + '.to');
+        if (dist(located.get(it.from), located.get(it.to)) < 1e-9) fail(w + '의 from과 to(긴 지름의 두 끝)는 서로 다른 자리여야 합니다.');
+        if (it.ratio !== undefined && !(finite(it.ratio) && it.ratio > 0 && it.ratio <= 1)) fail(w + '.ratio는 0보다 크고 1 이하인 납작한 정도(짧은 지름 ÷ 긴 지름)여야 합니다.');
+        if (it.back !== undefined && !['solid', 'dash', 'hide'].includes(it.back)) fail(w + '.back(위쪽 절반)은 solid, dash, hide 중 하나여야 합니다.');
       } else if (it.type === 'angle') {
         for (const k of ['at', 'from', 'to']) refs(ids, it[k], w + '.' + k);
         if (new Set([it.at, it.from, it.to]).size !== 3) fail(w + '의 세 점은 달라야 합니다.');
         if (!['arc', 'right'].includes(it.mark || 'arc')) fail(w + '.mark는 arc 또는 right여야 합니다.');
       } else if (it.type === 'text') {
         if (!(point(it.at) || ids.has(it.at)) || !str(it.text, 100)) fail(w + '에는 점 ID/[x,y]와 1~100자 text가 필요합니다.');
-      } else fail(w + '.type은 segment, line, ray, polygon, circle, arc, sector, angle, dim, text 중 하나여야 합니다.');
+      } else fail(w + '.type은 segment, line, ray, polygon, circle, ellipse, arc, sector, angle, dim, text 중 하나여야 합니다.');
       if (it.type === 'segment') {
         if (it.ticks !== undefined && ![1, 2, 3].includes(it.ticks)) fail(w + '.ticks는 1~3이어야 합니다.');
         if (it.parallel !== undefined && ![1, 2, 3].includes(it.parallel)) fail(w + '.parallel은 1~3이어야 합니다.');
@@ -138,7 +153,7 @@
       if (it.type === 'dim' && it.offset !== undefined && (!finite(it.offset) || Math.abs(it.offset) > 300)) fail(w + '.offset은 -300~300 픽셀이어야 합니다.');
       if (it.type === 'dim' && it.style !== undefined && !['line', 'text'].includes(it.style)) fail(w + '.style은 line 또는 text여야 합니다.');
       if (it.type === 'angle' && it.arcs !== undefined && ![1, 2, 3].includes(it.arcs)) fail(w + '.arcs는 1~3이어야 합니다.');
-      if (['polygon', 'circle', 'sector'].includes(it.type) && it.fill !== undefined && !['none', 'light'].includes(it.fill)) fail(w + '.fill은 none 또는 light여야 합니다.');
+      if (['polygon', 'circle', 'ellipse', 'sector'].includes(it.type) && it.fill !== undefined && !['none', 'light'].includes(it.fill)) fail(w + '.fill은 none 또는 light여야 합니다.');
       if (['arc', 'sector'].includes(it.type) && it.ccw !== undefined && typeof it.ccw !== 'boolean') fail(w + '.ccw는 true/false여야 합니다.');
       optionalLabel(it, w);
       return { ...it, id: itemId, ...(Array.isArray(it.points) ? { points: [...it.points] } : {}) };
@@ -146,7 +161,8 @@
     return { format: FORMAT, version: VERSION, unit: data.unit ?? 1, unitLabel: data.unitLabel ?? 'cm', grid: data.grid || false, toScale: data.toScale === true, settings, points, items };
   }
 
-  function bounds(doc, xy) {
+  // Every place the drawing reaches: points, text and the far sides of round shapes.
+  function reach(doc, xy) {
     const list = doc.points.map((p) => p.at);
     for (const it of doc.items) if (it.type === 'text') list.push(xy(it.at));
     for (const it of doc.items) if (['circle', 'arc', 'sector'].includes(it.type)) {
@@ -162,6 +178,21 @@
         }
       }
     }
+    for (const it of doc.items) if (it.type === 'ellipse') {
+      const e = ellipse(xy(it.from), xy(it.to), it.ratio), hx = Math.hypot(e.rx * e.u[0], e.ry * e.n[0]), hy = Math.hypot(e.rx * e.u[1], e.ry * e.n[1]);
+      list.push([e.c[0] - hx, e.c[1] - hy], [e.c[0] + hx, e.c[1] + hy]);
+    }
+    return list;
+  }
+  // Box around the drawing, for placing a new shape beside it; null when nothing is drawn.
+  function extent(data) {
+    const doc = validate(data), named = new Map(doc.points.map((p) => [p.id, p.at]));
+    const list = reach(doc, (ref) => typeof ref === 'string' ? named.get(ref) : ref);
+    if (!list.length) return null;
+    return { x0: Math.min(...list.map((p) => p[0])), y0: Math.min(...list.map((p) => p[1])), x1: Math.max(...list.map((p) => p[0])), y1: Math.max(...list.map((p) => p[1])) };
+  }
+  function bounds(doc, xy) {
+    const list = reach(doc, xy);
     if (!list.length) list.push([0, 0], [5, 5]);
     let x0 = Math.min(...list.map((p) => p[0])), y0 = Math.min(...list.map((p) => p[1]));
     let x1 = Math.max(...list.map((p) => p[0])), y1 = Math.max(...list.map((p) => p[1]));
@@ -220,9 +251,12 @@
     };
     const shown = (it, fallback) => it.question ? (options.answers ? (it.value ?? '?') : (it.label ?? '?')) : (it.label ?? it.value ?? fallback);
     const labelWidth = (value, size = fontSize) => [...String(value)].reduce((n, ch) => n + (/[\u1100-\u11ff\u2e80-\uffff]/u.test(ch) ? 1 : .55), 0) * size;
-    const labelPenalty = (at, value, size = fontSize) => {
+    // edge: the cost of reaching past the picture. An automatic export grows to fit its labels, so a
+    // length written beside its line may go out there rather than sit on another line.
+    const outside = fixed ? 100 : 3;
+    const labelPenalty = (at, value, size = fontSize, edge = 100) => {
       const tw = labelWidth(value, size);
-      let score = at[0] - tw / 2 < 1 || at[0] + tw / 2 > width - 1 || at[1] - size / 2 < 1 || at[1] + size / 2 > height - 1 ? 100 : 0;
+      let score = at[0] - tw / 2 < 1 || at[0] + tw / 2 > width - 1 || at[1] - size / 2 < 1 || at[1] + size / 2 > height - 1 ? edge : 0;
       for (const l of labels) if (Math.abs(at[0] - l.p[0]) < (tw + labelWidth(l.value)) / 2 + 3 && Math.abs(at[1] - l.p[1]) < size + 3) score += 50;
       for (const [a, b] of strokes) {
         if (at[0] < Math.min(a[0], b[0]) - tw / 2 - 3 || at[0] > Math.max(a[0], b[0]) + tw / 2 + 3 ||
@@ -233,12 +267,20 @@
       }
       return score;
     };
-    // Centre of the smallest polygon holding both points (else of all points): "outside" is away from it.
+    // Figures: points joined through items or point definitions (a cylinder's ends, its centre…).
+    const parent = new Map(doc.points.map((p) => [p.id, p.id]));
+    const figureOf = (id) => { while (parent.get(id) !== id) id = parent.get(id); return id; };
+    const join = (ids) => { const list = ids.filter((v) => typeof v === 'string' && parent.has(v)); for (const id of list.slice(1)) parent.set(figureOf(id), figureOf(list[0])); };
+    for (const it of doc.items) join([it.a, it.b, it.center, it.through, it.from, it.to, it.at, ...(it.points || [])]);
+    for (const p of doc.points) join([p.id, ...(p.on || []), ...(p.cross || []).flat()]);
+    // Centre of the smallest polygon holding both points, else of the figure they belong to (else of
+    // all points): "outside" is away from it, also when other figures sit beside this one.
     const centerFor = (ida, idb) => {
       const enclosing = doc.items.filter((p) => p.type === 'polygon' && p.points.includes(ida) && p.points.includes(idb));
       const area = (p) => Math.abs(p.points.reduce((sum, id, j) => sum + cross(xy(id), xy(p.points[(j + 1) % p.points.length])), 0));
       enclosing.sort((p, q) => area(p) - area(q));
-      const near = enclosing[0]?.points.map(xy) || doc.points.map((p) => p.at);
+      const figure = doc.points.filter((p) => figureOf(p.id) === figureOf(ida)).map((p) => p.at);
+      const near = enclosing[0]?.points.map(xy) || (figure.length > 2 ? figure : doc.points.map((p) => p.at));
       return [near.reduce((s, p) => s + p[0], 0) / (near.length || 1), near.reduce((s, p) => s + p[1], 0) / (near.length || 1)];
     };
     const segmentTexts = [];
@@ -274,6 +316,8 @@
       } else if (it.type === 'circle') {
         const c = P(it.center), r = (it.r ?? dist(xy(it.center), xy(it.through))) * actualScale;
         shapes.push(`<circle cx="${c[0]}" cy="${c[1]}" r="${num(r)}" fill="${it.fill === 'light' ? light : 'none'}"/>`);
+        const around = (j) => add(c, [r * Math.cos(j * Math.PI / 16), r * Math.sin(j * Math.PI / 16)]);
+        for (let j = 0; j < 32; j++) strokes.push([around(j), around(j + 1)]); // labels keep clear of the outline
       } else if (it.type === 'arc' || it.type === 'sector') {
         const c = xy(it.center), a = xy(it.from), b = xy(it.to), r = dist(c, a);
         if (Math.abs(dist(c, b) - r) > Math.max(1e-6, r * .001)) warnings.push({ code: 'arc-radius', item: i, message: '호의 두 끝점이 중심에서 같은 거리에 있지 않습니다.' });
@@ -282,6 +326,22 @@
         const end = add(c, [r * Math.cos(bc), r * Math.sin(bc)]), start = P(it.from), stop = toScreen(end), center = P(it.center);
         const d = `${it.type === 'sector' ? `M ${center[0]} ${center[1]} L ` : 'M '}${start[0]} ${start[1]} A ${num(r * actualScale)} ${num(r * actualScale)} 0 ${sweep > Math.PI ? 1 : 0} ${ccw ? 0 : 1} ${stop[0]} ${stop[1]}${it.type === 'sector' ? ' Z' : ''}`;
         path(d, ` fill="${it.fill === 'light' ? light : 'none'}"`);
+        const steps = Math.max(2, Math.ceil(sweep / (Math.PI / 16))), turn = (ccw ? 1 : -1) * sweep / steps;
+        const along = (j) => toScreen(add(c, [r * Math.cos(ac + turn * j), r * Math.sin(ac + turn * j)]));
+        for (let j = 0; j < steps; j++) strokes.push([along(j), along(j + 1)]);
+        if (it.type === 'sector') strokes.push([center, start], [stop, center]);
+      } else if (it.type === 'ellipse') {
+        // Two half arcs, so the back (upper) half can be dashed or left out.
+        const e = ellipse(xy(it.from), xy(it.to), it.ratio), back = it.back || 'solid', S = (t) => toScreen(onEllipse(e, t));
+        const end = S(0), start = S(Math.PI), top = S(Math.PI / 2);
+        // SVG sweep 1 turns clockwise on screen; take the turn that passes over the back point.
+        const sweep = cross(minus(start, end), minus(top, end)) > 0 ? 0 : 1;
+        const arcTo = (q) => `A ${num(e.rx * actualScale)} ${num(e.ry * actualScale)} ${num(Math.atan2(-e.u[1], e.u[0]) * 180 / Math.PI)} 0 ${sweep} ${q[0]} ${q[1]}`;
+        if (it.fill === 'light') path(`M ${end[0]} ${end[1]} ${arcTo(start)} ${arcTo(end)} Z`, ` fill="${light}" stroke="none"`);
+        if (back !== 'hide') path(`M ${end[0]} ${end[1]} ${arcTo(start)}`, back === 'dash' ? ' stroke-dasharray="4 3"' : '');
+        path(`M ${start[0]} ${start[1]} ${arcTo(end)}`);
+        // Labels keep clear of the outline too.
+        for (let j = back === 'hide' ? 12 : 0; j < 24; j++) strokes.push([S(j * Math.PI / 12), S((j + 1) * Math.PI / 12)]);
       } else if (it.type === 'angle') {
         const c = P(it.at), u = unit(minus(P(it.from), c)), v = unit(minus(P(it.to), c)), radius = 19;
         const dot = Math.max(-1, Math.min(1, u[0] * v[0] + u[1] * v[1]));
@@ -323,7 +383,7 @@
           let best = { at: labelAt, score: Infinity };
           for (const dir of [side, -side]) for (const shift of [15, 22, 30, 40]) for (const along of [0, -7, 7]) {
             const at = add(add(middle, mul(n, dir * shift)), mul(v, along));
-            const score = labelPenalty(at, label) + shift * .04 + (dir === side ? 0 : 1) + Math.abs(along) * .03;
+            const score = labelPenalty(at, label, fontSize, outside) + shift * .04 + (dir === side ? 0 : 1) + Math.abs(along) * .03;
             if (score < best.score) best = { at, score };
           }
           labelAt = best.at;
@@ -404,7 +464,46 @@
     try { const s = scene(data, options); return { ok: true, errors: [], warnings: s.warnings, info: { points: s.doc.points.length, items: s.doc.items.length, size: [s.width, s.height] } }; }
     catch (e) { return { ok: false, errors: [{ code: 'invalid', message: e.message }], warnings: [] }; }
   }
-  const api = { FORMAT, VERSION, validate, resolve, meet, scene, toSvg, renderSvg, check };
+  // Textbook pictures of round solids drawn with ellipses: 원기둥 (cylinder), 원뿔 (cone), 구 (sphere),
+  // 반구 (hemisphere, cut face up). r and h are drawing lengths; the base or centre sits at the
+  // origin. Part ids (radius, height, slant…) let an assistant turn one into a question.
+  const ROUND = { 원기둥: 'cylinder', 원뿔: 'cone', 구: 'sphere', 반구: 'hemisphere' };
+  function curved(kind, r, h, ratio = .3) {
+    const k = ROUND[kind] || kind;
+    if (!Object.values(ROUND).includes(k)) fail('입체는 원기둥, 원뿔, 구, 반구 (cylinder, cone, sphere, hemisphere) 중 하나입니다.');
+    if (!(finite(r) && r > 0)) fail('반지름은 0보다 큰 수여야 합니다.');
+    if ((k === 'cylinder' || k === 'cone') && !(finite(h) && h > 0)) fail('원기둥과 원뿔에는 0보다 큰 높이가 필요합니다.');
+    if (!(finite(ratio) && ratio > 0 && ratio <= 1)) fail('ratio는 0보다 크고 1 이하여야 합니다.');
+    const hidden = (id, at) => ({ id, at, show: false }), ry = r * ratio;
+    const ends = [hidden('A', [-r, 0]), hidden('B', [r, 0])], center = { id: 'O', on: ['A', 'B'] };
+    const base = (id, back) => ({ id, type: 'ellipse', from: 'A', to: 'B', ratio, ...(back ? { back } : {}) });
+    const radius = (a, b, dash) => [{ id: 'radius-line', type: 'segment', a, b, ...(dash ? { dash: true } : {}) }, { id: 'radius', type: 'dim', a, b, style: 'text' }];
+    if (k === 'cylinder') return {
+      points: [...ends, hidden('C', [-r, h]), hidden('D', [r, h]), { id: 'O', on: ['C', 'D'] }],
+      items: [{ id: 'top', type: 'ellipse', from: 'C', to: 'D', ratio }, base('base', 'dash'),
+        { id: 'side-left', type: 'segment', a: 'C', b: 'A' }, { id: 'side-right', type: 'segment', a: 'D', b: 'B' },
+        ...radius('O', 'D'), { id: 'height', type: 'dim', a: 'B', b: 'D' }],
+      box: [[-r, -ry], [r, h + ry]]
+    };
+    if (k === 'cone') return {
+      points: [...ends, center, hidden('P', [0, h])],
+      items: [base('base', 'dash'), { id: 'side-left', type: 'segment', a: 'P', b: 'A' }, { id: 'slant', type: 'segment', a: 'P', b: 'B' },
+        { id: 'height-line', type: 'segment', a: 'P', b: 'O', dash: true }, ...radius('O', 'B', true),
+        { id: 'right-angle', type: 'angle', from: 'B', at: 'O', to: 'P', mark: 'right' }, { id: 'height', type: 'dim', a: 'O', b: 'P', style: 'text' }],
+      box: [[-r, -ry], [r, h]]
+    };
+    if (k === 'sphere') return {
+      points: [...ends, center],
+      items: [{ id: 'outline', type: 'circle', center: 'O', through: 'B' }, base('equator', 'dash'), ...radius('O', 'B')],
+      box: [[-r, -r], [r, r]]
+    };
+    return {
+      points: [...ends, center],
+      items: [base('face'), { id: 'dome', type: 'arc', center: 'O', from: 'A', to: 'B' }, ...radius('O', 'B')],
+      box: [[-r, -r], [r, ry]]
+    };
+  }
+  const api = { FORMAT, VERSION, validate, resolve, meet, ellipse, ellipsePoint: onEllipse, curved, extent, scene, toSvg, renderSvg, check };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.SolidDiagram = api;
 })(typeof window !== 'undefined' ? window : globalThis);
