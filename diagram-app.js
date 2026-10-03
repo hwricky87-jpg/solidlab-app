@@ -51,6 +51,7 @@
     changed();
   }
   function changed() {
+    try { D.resolve(doc); } catch {} // derived points follow their sides; check reports a broken one
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => { try { localStorage.setItem(STORAGE, JSON.stringify({ doc, clean: !dirty() })); } catch {} }, 250);
     updateHistory(); updateProps(); updateCheck(); syncDocControls(); request(); shell().updateDirty?.();
@@ -73,15 +74,20 @@
     return undefined;
   }
   // A snap is either an existing point {id} or a free position {at}; creation turns it into a point.
+  // A crossing or a point on a side remembers how it was made (cross / on), so it follows the sides.
   function ensurePoint(snap) {
     if (snap.id) return snap.id;
     const id = nextId(), label = nextName();
-    doc.points.push({ id, at: snap.at.map((v) => Number(v.toFixed(6))), ...(label ? { label } : {}) });
+    doc.points.push({ id, at: snap.at.map((v) => Number(v.toFixed(6))), ...(label ? { label } : {}), ...(snap.def ? JSON.parse(JSON.stringify(snap.def)) : {}) });
     return id;
   }
+  // A point that stops following others keeps where it is now.
+  function freePoint(p) { delete p.on; delete p.t; delete p.cross; }
+  const derivedFrom = (p, id) => (p.on || []).includes(id) || (p.cross || []).flat().includes(id);
   function removePoint(id) {
     const uses = (it) => [it.a, it.b, it.center, it.through, it.from, it.to, it.at].includes(id) || (it.points || []).includes(id);
     doc.items = doc.items.filter((it) => !uses(it));
+    for (const p of doc.points) if (derivedFrom(p, id)) freePoint(p);
     doc.points = doc.points.filter((p) => p.id !== id);
   }
   function deleteSelection() {
@@ -99,6 +105,7 @@
     if (!active() || W < 80 || H < 80) return;
     const box = viewport();
     try {
+      D.resolve(doc);
       scene = D.scene(doc, { viewport: { ...box, bounds: box, width: W, height: H }, pixelsPerUnit: view.k, answers: $('dgAnswers').checked });
       drawing.innerHTML = D.toSvg(scene, { background: 'none' });
       toS = (p) => { const q = scene.toScreen(p); return Array.isArray(q) ? q : [q.x, q.y]; };
@@ -176,11 +183,14 @@
   function edges() {
     const list = [];
     for (const it of doc.items) {
-      if (['segment', 'line', 'ray'].includes(it.type)) list.push({ a: at(it.a), b: at(it.b), kind: it.type });
-      else if (it.type === 'polygon') it.points.forEach((id, i) => list.push({ a: at(id), b: at(it.points[(i + 1) % it.points.length]), kind: 'segment' }));
+      if (['segment', 'line', 'ray'].includes(it.type)) list.push({ a: at(it.a), b: at(it.b), kind: it.type, ids: [it.a, it.b] });
+      else if (it.type === 'polygon') it.points.forEach((id, i) => list.push({ a: at(id), b: at(it.points[(i + 1) % it.points.length]), kind: 'segment', ids: [id, it.points[(i + 1) % it.points.length]] }));
     }
     return list.filter((e) => e.a && e.b && dist(e.a, e.b) > 1e-9);
   }
+  // Ratio of q between the ends of e (0 at a, 1 at b).
+  const ratio = (e, q) => { const d = [e.b[0] - e.a[0], e.b[1] - e.a[1]]; return ((q[0] - e.a[0]) * d[0] + (q[1] - e.a[1]) * d[1]) / (d[0] * d[0] + d[1] * d[1]); };
+  const onDef = (e, q) => { const t = Number(ratio(e, q).toFixed(6)); return t >= 0 && t <= 1 ? { on: [...e.ids], ...(Math.abs(t - .5) > 1e-9 ? { t } : {}) } : undefined; };
   // Parameter t of the point on edge e nearest to m; segments clamp to their ends.
   function onEdge(e, m) {
     const d = [e.b[0] - e.a[0], e.b[1] - e.a[1]], l = d[0] * d[0] + d[1] * d[1];
@@ -207,10 +217,10 @@
     const m = toM(p), near = 14 * reach;
     if (!free) {
       // Only edges passing near the pointer can give a crossing or a snap, which keeps this cheap.
-      const list = edges().filter((e) => dist(toS(onEdge(e, m)), p) < near * 1.6), consider = (q, kind, radius) => { const d = dist(toS(q), p); if (d < radius && (!best || d < best.d)) best = { at: clean(q), kind, d }; };
-      for (let i = 0; i < list.length; i++) for (let j = i + 1; j < list.length; j++) { const q = crossing(list[i], list[j]); if (q) consider(q, '교점', 11 * reach); }
+      const list = edges().filter((e) => dist(toS(onEdge(e, m)), p) < near * 1.6), consider = (q, kind, radius, def) => { const d = dist(toS(q), p); if (d < radius && (!best || d < best.d)) best = { at: clean(q), kind, d, ...(def ? { def } : {}) }; };
+      for (let i = 0; i < list.length; i++) for (let j = i + 1; j < list.length; j++) { const q = crossing(list[i], list[j]); if (q) consider(q, '교점', 11 * reach, { cross: [[...list[i].ids], [...list[j].ids]] }); }
       if (best) return best;
-      for (const e of list) if (e.kind === 'segment') consider([(e.a[0] + e.b[0]) / 2, (e.a[1] + e.b[1]) / 2], '중점', 10 * reach);
+      for (const e of list) if (e.kind === 'segment') consider([(e.a[0] + e.b[0]) / 2, (e.a[1] + e.b[1]) / 2], '중점', 10 * reach, { on: [...e.ids] });
       if (best) return best;
       const step = prefs.snap;
       // Near a side the point always lands on it: at the grid crossing along the side when one is
@@ -219,7 +229,7 @@
       for (const e of list) {
         const q = onEdge(e, m), g = step > 0 ? m.map((v) => Math.round(v / step) * step) : null;
         const onGrid = g && dist(onEdge(e, g), g) < 1e-9 && dist(toS(g), p) < near;
-        consider(onGrid ? g : q, '변 위', near * 1.6);
+        consider(onGrid ? g : q, '변 위', near * 1.6, onDef(e, onGrid ? g : q));
       }
       if (best) return best;
     }
@@ -386,7 +396,8 @@
     if (drag?.kind === 'move') {
       const pt = pointById(drag.id), snap = snapAt(p, e.shiftKey, drag.id);
       if (!pt || snap.id) return;
-      if (dist(pt.at, snap.at) > 1e-9) { pt.at = snap.at.map((v) => Number(v.toFixed(6))); drag.moved = true; request(); }
+      // Dragging a crossing or a midpoint makes it a free point at the new place.
+      if (dist(pt.at, snap.at) > 1e-9) { freePoint(pt); pt.at = snap.at.map((v) => Number(v.toFixed(6))); drag.moved = true; request(); }
       return;
     }
     // A finger slides the snap marker to the exact spot; the point is placed on release.
@@ -466,8 +477,14 @@
       const p = pointById(selection.id);
       parts.push(field('이름 (ㄱ, A…)', textInput(p.label, (v) => set(p, 'label', v.slice(0, 20), !v), 'dgPropLabel', '비우면 이름 없음')));
       const row = document.createElement('div'); row.className = 'field-row two';
-      row.append(field('x', numberInput(p.at[0], (v) => commit(() => { p.at = [v, p.at[1]]; }))), field('y', numberInput(p.at[1], (v) => commit(() => { p.at = [p.at[0], v]; }))));
+      row.append(field('x', numberInput(p.at[0], (v) => commit(() => { freePoint(p); p.at = [v, p.at[1]]; }))), field('y', numberInput(p.at[1], (v) => commit(() => { freePoint(p); p.at = [p.at[0], v]; }))));
       parts.push(row);
+      if (p.on || p.cross) {
+        const name = (r) => typeof r === 'string' ? (pointById(r)?.label || r) : '(' + r.map(fmt).join(', ') + ')';
+        parts.push(info(p.on ? name(p.on[0]) + ' · ' + name(p.on[1]) + ' 사이의 점 (비율 ' + fmt(p.t ?? .5) + ')\n두 점을 옮기면 따라갑니다.' : '두 직선 ' + p.cross[0].map(name).join('') + ', ' + p.cross[1].map(name).join('') + '의 교점\n선을 옮기면 따라갑니다.'));
+        const unlink = Object.assign(document.createElement('button'), { className: 'small full', textContent: '이 자리에 고정하기' });
+        unlink.addEventListener('click', () => commit(() => freePoint(p))); parts.push(unlink);
+      }
       parts.push(field('이름 위치', select([['auto', '자동'], ['90', '위'], ['270', '아래'], ['180', '왼쪽'], ['0', '오른쪽'], ['135', '왼쪽 위'], ['45', '오른쪽 위'], ['225', '왼쪽 아래'], ['315', '오른쪽 아래']], String(p.labelAt ?? 'auto'), (v) => set(p, 'labelAt', Number(v), v === 'auto'))));
       parts.push(toggle('점 찍어 보이기', p.show !== false, (v) => set(p, 'show', false, v)));
     } else {
@@ -479,6 +496,7 @@
           parts.push(field('같은 길이 표시', select([['0', '없음'], ['1', '빗금 1개'], ['2', '빗금 2개'], ['3', '빗금 3개']], String(it.ticks || 0), (v) => set(it, 'ticks', Number(v), v === '0'))));
           parts.push(field('평행 표시', select([['0', '없음'], ['1', '1개'], ['2', '2개'], ['3', '3개']], String(it.parallel || 0), (v) => set(it, 'parallel', Number(v), v === '0'))));
           parts.push(field('화살표', select([['', '없음'], ['end', '끝에'], ['both', '양쪽']], it.arrows || '', (v) => set(it, 'arrows', v, !v))));
+          labelFields(it, parts, '선분 옆 기호 (㉠, a, 6 cm…)', '비우면 없음');
           parts.push(info('길이 ' + unitText(dist(A(it.a), A(it.b)))));
         }
       } else if (it.type === 'polygon') {
@@ -513,8 +531,8 @@
     remove.style.marginTop = '12px'; remove.addEventListener('click', deleteSelection);
     box.append(...parts, remove);
   }
-  function labelFields(it, parts) {
-    parts.push(field('그림에 쓸 글자 (비우면 그린 값)', textInput(it.label, (v) => set(it, 'label', v, !v), null, '예: ?, ㉠, 60°')));
+  function labelFields(it, parts, caption = '그림에 쓸 글자 (비우면 그린 값)', placeholder = '예: ?, ㉠, 60°') {
+    parts.push(field(caption, textInput(it.label, (v) => set(it, 'label', v, !v), null, placeholder)));
     parts.push(toggle('문제로 표시 (정답 보기에서만 정답)', it.question, (v) => set(it, 'question', true, !v)));
     if (it.question) parts.push(field('정답', textInput(it.value === undefined ? '' : String(it.value), (v) => set(it, 'value', v !== '' && Number.isFinite(Number(v)) ? Number(v) : v, v === ''), null, '예: 5')));
   }
@@ -552,7 +570,7 @@
     try { D.validate(data); } catch (error) { message(error.message, true); return false; }
     if (dirty() && !window.confirm('저장하지 않은 평면 그림이 있습니다. 새 파일로 바꿀까요?')) return false;
     setMode('diagram');
-    doc = clone(data); history = []; future = []; selection = null; pending = []; checkpoint = JSON.stringify(doc);
+    doc = D.resolve(clone(data)); history = []; future = []; selection = null; pending = []; checkpoint = JSON.stringify(doc);
     changed(); fit(); message('평면 그림을 열었습니다.'); return true;
   }
   async function open() {
@@ -792,7 +810,7 @@
   // Restore the last diagram from this browser; a file-saved state stays "clean".
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE) || 'null');
-    if (saved?.doc) { D.validate(saved.doc); doc = saved.doc; checkpoint = saved.clean ? JSON.stringify(doc) : JSON.stringify(blank()); }
+    if (saved?.doc) { D.validate(saved.doc); doc = D.resolve(saved.doc); checkpoint = saved.clean ? JSON.stringify(doc) : JSON.stringify(blank()); }
   } catch {}
   window.SolidDiagramApp = { load, command, setMode, dirty, save, snapshot: () => clone(doc) };
   setTool('segment'); changed();

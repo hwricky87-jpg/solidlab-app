@@ -205,7 +205,16 @@
       if (next.size > MAX_BLOCKS) throw new Error('치수를 늘린 결과가 100,000개 블록을 초과합니다.');
     }
     const mapPoint = (p) => p.map((v, i) => i === axis ? mapCoordinate(v) : v);
-    return { cells: next, mapPoint, pieces };
+    // Points and segment ends stretch with their piece instead of snapping to the grid, so a
+    // crossing or a midpoint stays one after resizing (corners land on whole numbers anyway).
+    const mapExact = (v) => {
+      if (v <= lo) return anchor === 'end' ? v - delta : v;
+      if (v >= hi) return anchor === 'end' ? v : v + delta;
+      let i = 0; while (breaks[i + 1] < v) i++;
+      return starts[i] + (v - breaks[i]) * alloc[i] / lengths[i];
+    };
+    const mapFree = (p) => p.map((v, i) => i !== axis ? v : Number(mapExact(v).toFixed(9)));
+    return { cells: next, mapPoint, mapFree, pieces };
   }
 
   const UNIT_LABELS = ['cm', 'mm', 'm', '칸'];
@@ -222,6 +231,106 @@
     if (d.label !== undefined) { if (!textValue(d.label)) invalid(where + '.label은 1~30자의 글자여야 합니다. 예: "?", "㉠", "x cm"'); result.label = d.label; }
     if (d.question !== undefined) { if (typeof d.question !== 'boolean') invalid(where + '.question은 true 또는 false여야 합니다.'); if (d.question) result.question = true; }
     return result;
+  }
+
+  // --- Points and auxiliary segments --------------------------------------------------------
+  // A point may sit anywhere on the figure (a midpoint is x.5). "on" places it between two
+  // points (t = 0.5 is the middle) and "cross" where two lines meet, so it follows them when the
+  // solid is resized. Vertex names (labels) are points too, and segments may join any of them.
+  const MARK_ID = /^[\p{L}\p{N}_-]{1,30}$/u;
+  const SEGMENT_STYLES = ['solid', 'dash', 'bold', 'none'];
+  const BEHIND_STYLES = ['dash', 'hide', 'same'];
+  const isCoord = (p) => Array.isArray(p) && p.length === 3 && p.every((v) => typeof v === 'number' && Number.isFinite(v) && Math.abs(v) <= COORD_LIMIT);
+  const tidy = (v) => { const r = Number(v.toFixed(9)); return Object.is(r, -0) ? 0 : r; };
+  const copyRef = (r) => Array.isArray(r) ? [...r] : r;
+
+  // Where the lines AB and CD meet, or null when they are parallel or skew.
+  function lineCross(a, b, c, d) {
+    const u = sub(b, a), v = sub(d, c), w = sub(a, c);
+    const A = dot(u, u), B = dot(u, v), C = dot(v, v), D = dot(u, w), E = dot(v, w), den = A * C - B * B;
+    if (A < 1e-12 || C < 1e-12 || den < 1e-9 * A * C) return null;
+    const s = (B * E - C * D) / den, t = (A * E - B * D) / den;
+    const p = add(a, mul(u, s)), q = add(c, mul(v, t));
+    return length(sub(p, q)) > 1e-6 * Math.max(1, Math.sqrt(A), Math.sqrt(C)) ? null : mul(add(p, q), .5);
+  }
+
+  function resolveMarks(labels, pointList, segmentList) {
+    if (pointList !== undefined && (!Array.isArray(pointList) || pointList.length > 200)) invalid('points는 200개 이하의 배열이어야 합니다.');
+    if (segmentList !== undefined && (!Array.isArray(segmentList) || segmentList.length > 200)) invalid('segments는 200개 이하의 배열이어야 합니다.');
+    const resolved = new Map(labels.map((l) => [l.id, l.at])), defs = new Map(), busy = new Set();
+    (pointList || []).forEach((p, index) => {
+      const where = 'points[' + index + ']';
+      if (!p || typeof p !== 'object' || Array.isArray(p)) invalid(where + '는 {id, at} 객체여야 합니다.');
+      const id = p.id ?? 'point-' + (index + 1);
+      if (typeof id !== 'string' || !MARK_ID.test(id) || resolved.has(id) || defs.has(id)) invalid(where + '.id는 중복 없는 1~30자 이름(글자·숫자·_·-)이어야 하고 labels의 id와도 달라야 합니다.');
+      if (['at', 'on', 'cross'].filter((k) => p[k] !== undefined).length !== 1) invalid(where + '에는 위치 at, on, cross 중 하나만 넣어야 합니다.');
+      if (p.t !== undefined && (p.on === undefined || typeof p.t !== 'number' || !(p.t >= 0 && p.t <= 1))) invalid(where + '.t는 on과 함께 쓰는 0~1 사이 비율입니다 (0.5 = 가운데).');
+      if (p.label !== undefined && (!textValue(p.label) || p.label.length > 12)) invalid(where + '.label은 1~12자여야 합니다. 예: "ㄱ", "M"');
+      if (p.dot !== undefined && typeof p.dot !== 'boolean') invalid(where + '.dot은 true 또는 false여야 합니다.');
+      if (p.labelAt !== undefined && !(typeof p.labelAt === 'number' && Number.isFinite(p.labelAt))) invalid(where + '.labelAt은 이름을 둘 방향(도, 0 = 오른쪽, 90 = 위)입니다.');
+      if (p.visible !== undefined && typeof p.visible !== 'boolean') invalid(where + '.visible은 true 또는 false여야 합니다.');
+      defs.set(id, { p, where });
+    });
+    const ref = (r, where) => {
+      if (isCoord(r)) return r.map(tidy);
+      if (typeof r === 'string' && (resolved.has(r) || defs.has(r))) return locate(r);
+      return invalid(where + '는 점 id 또는 [x,y,z] 좌표여야 합니다: ' + JSON.stringify(r));
+    };
+    const locate = (id) => {
+      if (resolved.has(id)) return resolved.get(id);
+      if (busy.has(id)) invalid('점 ' + id + '의 위치가 서로를 참조합니다(순환).');
+      busy.add(id);
+      const { p, where } = defs.get(id);
+      let at;
+      if (p.at !== undefined) {
+        if (!isCoord(p.at)) invalid(where + '.at은 [x,y,z] 숫자 3개(-500~500)여야 합니다. 모서리 가운데는 2.5처럼 씁니다.');
+        at = p.at;
+      } else if (p.on !== undefined) {
+        if (!Array.isArray(p.on) || p.on.length !== 2) invalid(where + '.on은 [점1, 점2]입니다. 두 점을 잇는 선분 위 비율 t(기본 0.5) 자리에 놓입니다.');
+        const a = ref(p.on[0], where + '.on[0]'), b = ref(p.on[1], where + '.on[1]'), t = p.t ?? .5;
+        at = a.map((v, i) => v + (b[i] - v) * t);
+      } else {
+        if (!Array.isArray(p.cross) || p.cross.length !== 2 || !p.cross.every((l) => Array.isArray(l) && l.length === 2)) invalid(where + '.cross는 [[점1, 점2], [점3, 점4]] 두 직선입니다.');
+        const [[a, b], [c, d]] = p.cross.map((l, i) => l.map((r, j) => ref(r, where + '.cross[' + i + '][' + j + ']')));
+        at = lineCross(a, b, c, d);
+        if (!at) invalid(where + '.cross의 두 직선이 한 점에서 만나지 않습니다 (평행하거나 꼬인 위치).');
+      }
+      at = at.map(tidy);
+      busy.delete(id); resolved.set(id, at); return at;
+    };
+    const points = [...defs].map(([id, { p }]) => ({
+      id, at: locate(id), def: p.at !== undefined ? { at: [...p.at] } : p.on !== undefined ? { on: p.on.map(copyRef), ...(p.t !== undefined ? { t: p.t } : {}) } : { cross: p.cross.map((l) => l.map(copyRef)) },
+      ...(p.label !== undefined ? { label: p.label } : {}), dot: p.dot !== false, ...(p.labelAt !== undefined ? { labelAt: p.labelAt } : {}), visible: p.visible !== false
+    }));
+    const segmentIds = new Set();
+    const segments = (segmentList || []).map((s, index) => {
+      const where = 'segments[' + index + ']';
+      if (!s || typeof s !== 'object' || Array.isArray(s)) invalid(where + '는 {a, b} 객체여야 합니다.');
+      const id = s.id ?? 'seg-' + (index + 1);
+      if (typeof id !== 'string' || !MARK_ID.test(id) || segmentIds.has(id)) invalid(where + '.id는 중복 없는 1~30자 이름(글자·숫자·_·-)이어야 합니다.');
+      segmentIds.add(id);
+      const from = ref(s.a, where + '.a'), to = ref(s.b, where + '.b');
+      if (length(sub(to, from)) < 1e-9) invalid(where + '의 두 끝점이 같습니다.');
+      if (s.style !== undefined && !SEGMENT_STYLES.includes(s.style)) invalid(where + '.style은 solid(실선), dash(점선), bold(굵은 선), none(선 없이 기호만) 중 하나입니다.');
+      if (s.behind !== undefined && !BEHIND_STYLES.includes(s.behind)) invalid(where + '.behind는 dash(가려진 부분 점선), hide(가려진 부분 숨김), same(가려져도 그대로) 중 하나입니다.');
+      if (s.label !== undefined && !textValue(s.label)) invalid(where + '.label은 1~30자의 글자여야 합니다. 예: "㉠", "a", "6 cm"');
+      if (s.ticks !== undefined && ![1, 2, 3].includes(s.ticks)) invalid(where + '.ticks(같은 길이 표시)는 1~3입니다.');
+      if (s.visible !== undefined && typeof s.visible !== 'boolean') invalid(where + '.visible은 true 또는 false여야 합니다.');
+      return { id, a: copyRef(s.a), b: copyRef(s.b), from, to, style: s.style ?? 'solid', behind: s.behind ?? 'dash',
+        ...(s.label !== undefined ? { label: s.label } : {}), ...(s.ticks ? { ticks: s.ticks } : {}), visible: s.visible !== false };
+    });
+    return { points, segments };
+  }
+  // Saved form: the definition (at, on or cross), never the derived coordinates.
+  const encodePoint = (p) => ({ id: p.id, ...JSON.parse(JSON.stringify(p.def)), ...(p.label !== undefined ? { label: p.label } : {}), dot: p.dot, ...(p.labelAt !== undefined ? { labelAt: p.labelAt } : {}), visible: p.visible });
+  const encodeSegment = (s) => ({ id: s.id, a: copyRef(s.a), b: copyRef(s.b), style: s.style, behind: s.behind, ...(s.label !== undefined ? { label: s.label } : {}), ...(s.ticks ? { ticks: s.ticks } : {}), visible: s.visible });
+  // Move every coordinate written in points and segments (ids follow their own points).
+  function mapMarks(data, map) {
+    const ref = (r) => Array.isArray(r) ? map(r) : r;
+    return {
+      points: (data.points || []).map((p) => ({ ...p, ...(p.at ? { at: map(p.at) } : {}), ...(p.on ? { on: p.on.map(ref) } : {}), ...(p.cross ? { cross: p.cross.map((l) => l.map(ref)) } : {}) })),
+      segments: (data.segments || []).map((s) => ({ ...s, a: ref(s.a), b: ref(s.b) }))
+    };
   }
 
   function validateProject(data) {
@@ -299,6 +408,7 @@
       labelIds.add(id);
       labels.push({ id, at: [...l.at], text: l.text, visible: l.visible !== false });
     });
+    const { points, segments } = resolveMarks(labels, data.points, data.segments);
     const settings = { ...SETTING_DEFAULTS }, source = data.settings ?? {};
     if (typeof source !== 'object' || Array.isArray(source)) invalid('settings는 객체여야 합니다.');
     for (const name of BOOLEAN_SETTINGS) if (source[name] !== undefined) {
@@ -312,7 +422,7 @@
     for (const name of ['yaw', 'pitch']) if (view[name] !== undefined && !Number.isFinite(view[name])) invalid('view.' + name + '는 라디안 숫자여야 합니다.');
     if (view.projection !== undefined && !['orthographic', 'oblique'].includes(view.projection)) invalid('view.projection은 "orthographic" 또는 "oblique"(겨냥도)여야 합니다.');
     return {
-      cells, unit: data.unit, unitLabel: data.unitLabel ?? 'cm', dimensions, overallDimensions: overall, labels, settings,
+      cells, unit: data.unit, unitLabel: data.unitLabel ?? 'cm', dimensions, overallDimensions: overall, labels, points, segments, settings,
       view: { yaw: view.yaw ?? .76, pitch: Math.max(-1.55, Math.min(1.5707963, view.pitch ?? .53)), ...(view.projection === 'oblique' ? { projection: 'oblique' } : {}) }
     };
   }
@@ -344,11 +454,13 @@
 
   function encodeProject(data, legacy = false) {
     const p = validateProject(data), result = { ...data, version: legacy ? 1 : 2 };
-    delete result.blocks; delete result.boxes; delete result.labels;
+    delete result.blocks; delete result.boxes; delete result.labels; delete result.points; delete result.segments;
     Object.assign(result, legacy ? { blocks: [...p.cells].map(point) } : packCells(p.cells));
     result.unitLabel = p.unitLabel;
     result.dimensions = p.dimensions; result.overallDimensions = p.overallDimensions;
     if (p.labels.length) result.labels = p.labels;
+    if (p.points.length) result.points = p.points.map(encodePoint);
+    if (p.segments.length) result.segments = p.segments.map(encodeSegment);
     result.settings = p.settings; result.view = p.view;
     return result;
   }
@@ -419,6 +531,13 @@
     let full = 0;
     for (let i = 0; i < 8; i++) if (has(p[0] - (i & 1), p[1] - (i >> 1 & 1), p[2] - (i >> 2 & 1))) full++;
     return full > 0 && full < 8;
+  }
+  // Any point (midpoints too): 'surface', 'inside' the solid, or 'outside' it, from the cells it touches.
+  function pointPlace(has, p) {
+    const spans = p.map((v) => { const r = Math.round(v); return Math.abs(v - r) < 1e-9 ? [r - 1, r] : [Math.floor(v)]; });
+    let full = 0, total = 0;
+    for (const x of spans[0]) for (const y of spans[1]) for (const z of spans[2]) { total++; if (has(x, y, z)) full++; }
+    return full === 0 ? 'outside' : full === total ? 'inside' : 'surface';
   }
   // Attached: both ends touch the solid, and an axis-aligned measurement runs along its surface.
   function dimensionAttachment(has, d) {
@@ -565,12 +684,15 @@
       components: componentCount(p.cells),
       dimensions: dims.map((d) => ({ ...d, length: round6(length(sub(d.b, d.a)) * p.unit), effectiveVisible: d.visible !== false && p.settings[d.kind === 'overall' ? 'overall' : 'annotations'] })),
       labels: p.labels.map((l) => ({ ...l, onShape: onSurface(has, l.at), effectiveVisible: l.visible && p.settings.labels })),
+      ...(p.points.length ? { points: p.points.map((pt) => ({ ...encodePoint(pt), at: pt.at, place: pointPlace(has, pt.at) })) } : {}),
+      ...(p.segments.length ? { segments: p.segments.map((s) => ({ ...encodeSegment(s), from: s.from, to: s.to, length: round6(length(sub(s.to, s.from)) * p.unit) })) } : {}),
       settings: p.settings, view: p.view
     };
   }
 
   const api = { MAX_BLOCKS, UNIT_LABELS, key, point, add, sub, mul, dot, length, bounds, cuboid, editRegion, extractSurface, basis, raycast, brushRegion, resizeInterval, validateProject, overallDimensions, describeProject, packCells, encodeProject, stringifyProject,
-    occupancy, onSurface, dimensionAttachment, cavityAnalysis, componentCount, unsupportedBlocks, projections, heightmapCells };
+    occupancy, onSurface, pointPlace, dimensionAttachment, cavityAnalysis, componentCount, unsupportedBlocks, projections, heightmapCells,
+    lineCross, resolveMarks, encodePoint, encodeSegment, mapMarks };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.SolidGeometry = api;
 })(typeof window !== 'undefined' ? window : globalThis);

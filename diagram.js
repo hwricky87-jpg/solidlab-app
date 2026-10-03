@@ -26,6 +26,52 @@
     if (item.question !== undefined && typeof item.question !== 'boolean') fail(where + '.question은 true/false여야 합니다.');
   };
 
+  // Where lines AB and CD meet (they need not be drawn that far), or null when parallel.
+  function meet(a, b, c, d) {
+    const r = minus(b, a), s = minus(d, c), den = cross(r, s);
+    if (Math.abs(den) < 1e-12 * Math.max(1e-12, len(r) * len(s))) return null;
+    return add(a, mul(r, cross(minus(c, a), s) / den));
+  }
+  // A point is either fixed ("at") or derived: "on" [P, Q] at ratio t (0.5 = middle), or "cross"
+  // of lines [[P, Q], [R, S]]. Derived points are recomputed, so they follow when P moves.
+  function locate(list) {
+    const byId = new Map(list.map((p, i) => [p?.id, { p, w: 'points[' + i + ']' }])), out = new Map(), busy = new Set();
+    const ref = (r, w) => {
+      if (point(r)) return r;
+      if (typeof r === 'string' && byId.has(r)) return place(r);
+      return fail(w + '는 점 ID 또는 [x,y] 좌표여야 합니다: ' + JSON.stringify(r));
+    };
+    const place = (id) => {
+      if (out.has(id)) return out.get(id);
+      const { p, w } = byId.get(id);
+      if (busy.has(id)) fail(w + ' ' + id + '의 위치가 서로를 참조합니다(순환).');
+      busy.add(id);
+      let at;
+      if (p.on !== undefined) {
+        if (!Array.isArray(p.on) || p.on.length !== 2) fail(w + '.on은 [점1, 점2]입니다. 두 점 사이 비율 t(기본 0.5) 자리에 놓입니다.');
+        if (p.t !== undefined && !(finite(p.t) && p.t >= 0 && p.t <= 1)) fail(w + '.t는 0~1 사이 비율입니다 (0.5 = 가운데).');
+        const a = ref(p.on[0], w + '.on[0]'), b = ref(p.on[1], w + '.on[1]');
+        at = add(a, mul(minus(b, a), p.t ?? .5));
+      } else if (p.cross !== undefined) {
+        if (!Array.isArray(p.cross) || p.cross.length !== 2 || !p.cross.every((l) => Array.isArray(l) && l.length === 2)) fail(w + '.cross는 [[점1, 점2], [점3, 점4]] 두 직선입니다.');
+        const [[a, b], [c, d]] = p.cross.map((l, i) => l.map((r, j) => ref(r, w + '.cross[' + i + '][' + j + ']')));
+        at = meet(a, b, c, d);
+        if (!at) fail(w + '.cross의 두 직선이 평행해서 만나지 않습니다.');
+      } else at = p.at;
+      if (!point(at)) fail(w + '.at은 유한한 [x,y] 좌표여야 합니다.');
+      at = at.map((v) => Number(v.toFixed(9)));
+      busy.delete(id); out.set(id, at); return at;
+    };
+    for (const p of list) place(p.id);
+    return out;
+  }
+  // Recompute derived points of an editable document in place (the editor keeps at as a cache).
+  function resolve(doc) {
+    const at = locate(doc.points);
+    for (const p of doc.points) if (p.on !== undefined || p.cross !== undefined) p.at = at.get(p.id);
+    return doc;
+  }
+
   function validate(data) {
     if (!data || typeof data !== 'object' || Array.isArray(data) || data.format !== FORMAT || data.version !== VERSION) fail('format은 solidlab-diagram, version은 1이어야 합니다.');
     if (data.unit !== undefined && (!finite(data.unit) || data.unit <= 0)) fail('unit은 0보다 큰 숫자여야 합니다.');
@@ -40,13 +86,18 @@
     const ids = new Set(), points = data.points.map((p, i) => {
       const w = 'points[' + i + ']';
       if (!p || !str(p.id, 30) || !/^[\p{L}\p{N}_-]+$/u.test(p.id) || ids.has(p.id)) fail(w + '.id는 중복 없는 1~30자 점 이름이어야 합니다.');
-      if (!point(p.at)) fail(w + '.at은 유한한 [x,y] 좌표여야 합니다.');
+      const derived = (p.on !== undefined) + (p.cross !== undefined);
+      if (derived > 1) fail(w + '에는 on과 cross 중 하나만 넣어야 합니다.');
+      if (!derived && !point(p.at)) fail(w + '.at은 유한한 [x,y] 좌표여야 합니다. (또는 on·cross로 다른 점에서 정하기)');
+      if (p.t !== undefined && p.on === undefined) fail(w + '.t는 on과 함께 쓰는 비율입니다.');
       if (p.label !== undefined && !str(p.label, 20)) fail(w + '.label은 1~20자여야 합니다.');
       if (p.labelAt !== undefined && p.labelAt !== 'auto' && !finite(p.labelAt)) fail(w + '.labelAt은 auto 또는 각도여야 합니다.');
       if (p.show !== undefined && typeof p.show !== 'boolean') fail(w + '.show는 true/false여야 합니다.');
       ids.add(p.id);
-      return { ...p, at: [...p.at], show: p.show !== false };
+      return { ...p, show: p.show !== false };
     });
+    const located = locate(points);
+    for (const p of points) p.at = [...located.get(p.id)];
     const itemIds = new Set();
     const items = data.items.map((it, i) => {
       const w = 'items[' + i + ']';
@@ -182,6 +233,15 @@
       }
       return score;
     };
+    // Centre of the smallest polygon holding both points (else of all points): "outside" is away from it.
+    const centerFor = (ida, idb) => {
+      const enclosing = doc.items.filter((p) => p.type === 'polygon' && p.points.includes(ida) && p.points.includes(idb));
+      const area = (p) => Math.abs(p.points.reduce((sum, id, j) => sum + cross(xy(id), xy(p.points[(j + 1) % p.points.length])), 0));
+      enclosing.sort((p, q) => area(p) - area(q));
+      const near = enclosing[0]?.points.map(xy) || doc.points.map((p) => p.at);
+      return [near.reduce((s, p) => s + p[0], 0) / (near.length || 1), near.reduce((s, p) => s + p[1], 0) / (near.length || 1)];
+    };
+    const segmentTexts = [];
     const grid = options.grid === undefined ? doc.grid : options.grid;
     if (grid && grid.step) {
       const step = grid.step;
@@ -203,6 +263,10 @@
             const q = diagonal ? unit(add(n, mul(v, .5))) : n;
             line(add(c, mul(q, -5)), add(c, mul(q, 5)));
           }
+          // A symbol beside the segment (㉠, a, 6 cm): placed after every line is known.
+          const symbol = shown(it, '');
+          if (symbol) segmentTexts.push({ it, i, a, b, symbol });
+          if (it.question && it.value === undefined) warnings.push({ code: 'answer-missing', item: i, message: '문제로 표시한 선분에 정답 value가 없습니다.' });
         }
       } else if (it.type === 'polygon') {
         const q = it.points.map(P); shapes.push(`<polygon points="${q.map((p) => p.map(num).join(',')).join(' ')}" fill="${it.fill === 'light' ? light : 'none'}"/>`);
@@ -243,12 +307,7 @@
         }
       } else if (it.type === 'dim') {
         const a = P(it.a), b = P(it.b), v = unit(minus(b, a)), n = [-v[1], v[0]], off = it.offset ?? 25;
-        const enclosing = doc.items.filter((p) => p.type === 'polygon' && p.points.includes(it.a) && p.points.includes(it.b));
-        const area = (p) => Math.abs(p.points.reduce((sum, id, j) => sum + cross(xy(id), xy(p.points[(j + 1) % p.points.length])), 0));
-        enclosing.sort((p, q) => area(p) - area(q));
-        const near = enclosing[0]?.points.map(xy) || doc.points.map((p) => p.at);
-        const modelCenter = [near.reduce((s, p) => s + p[0], 0) / (near.length || 1), near.reduce((s, p) => s + p[1], 0) / (near.length || 1)];
-        const centerScreen = toScreen(modelCenter), middle = mul(add(a, b), .5);
+        const centerScreen = toScreen(centerFor(it.a, it.b)), middle = mul(add(a, b), .5);
         const outward = (minus(middle, centerScreen)[0] * n[0] + minus(middle, centerScreen)[1] * n[1]) >= 0 ? 1 : -1;
         const side = outward * (off < 0 ? -1 : 1), signed = side * Math.abs(off);
         const da = add(a, mul(n, signed)), db = add(b, mul(n, signed));
@@ -277,6 +336,17 @@
             warnings.push({ code: 'dimension-scale', item: i, message: '실제 비율 도형의 치수 값이 좌표 거리와 다릅니다.' });
         }
       } else if (it.type === 'text') text(toScreen(xy(it.at)), it.text);
+    }
+    for (const { it, a, b, symbol } of segmentTexts) {
+      const v = unit(minus(b, a)), n = [-v[1], v[0]], middle = mul(add(a, b), .5), c = toScreen(centerFor(it.a, it.b));
+      const outward = (middle[0] - c[0]) * n[0] + (middle[1] - c[1]) * n[1] >= 0 ? 1 : -1, reachOut = Math.abs(n[0]) * labelWidth(symbol) / 2 + Math.abs(n[1]) * fontSize / 2;
+      let best = null;
+      for (const dir of [outward, -outward]) for (const shift of [5, 9, 14, 20]) for (const along of [0, -8, 8]) {
+        const at = add(add(middle, mul(n, dir * (shift + reachOut))), mul(v, along));
+        const score = labelPenalty(at, symbol) + shift * .05 + (dir === outward ? 0 : .6) + Math.abs(along) * .05;
+        if (!best || score < best.score) best = { at, score };
+      }
+      text(best.at, symbol, it.question && options.answers ? ' fill="#b3261e" font-weight="700"' : '');
     }
     const center = [doc.points.reduce((s, p) => s + p.at[0], 0) / (doc.points.length || 1), doc.points.reduce((s, p) => s + p.at[1], 0) / (doc.points.length || 1)];
     for (const p of doc.points) {
@@ -334,7 +404,7 @@
     try { const s = scene(data, options); return { ok: true, errors: [], warnings: s.warnings, info: { points: s.doc.points.length, items: s.doc.items.length, size: [s.width, s.height] } }; }
     catch (e) { return { ok: false, errors: [{ code: 'invalid', message: e.message }], warnings: [] }; }
   }
-  const api = { FORMAT, VERSION, validate, scene, toSvg, renderSvg, check };
+  const api = { FORMAT, VERSION, validate, resolve, meet, scene, toSvg, renderSvg, check };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.SolidDiagram = api;
 })(typeof window !== 'undefined' ? window : globalThis);

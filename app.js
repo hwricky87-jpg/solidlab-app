@@ -11,15 +11,15 @@
   const RECOVERY_KEY = STORAGE_KEY + '-previous';
   const DEFAULT_SETTINGS = { grid: true, floor: true, overall: true, annotations: true, hidden: false, labels: true, style: 'color', dimStyle: 'line' };
   const state = {
-    cells: new Set(), unit: 1, unitLabel: 'cm', dimensions: [], labels: [],
+    cells: new Set(), unit: 1, unitLabel: 'cm', dimensions: [], labels: [], points: [], segments: [],
     settings: { ...DEFAULT_SETTINGS },
     view: { yaw: .76, pitch: .53, scale: 18, panX: 0, panY: 0, target: [7, 7.5, 8.5], autoFit: true },
-    tool: 'orbit', selection: new Set(), pointMode: false, labelMode: false, points: [], overallOffsets: [46, 46, 46], overallVisible: [true, true, true], overallMeta: [{}, {}, {}], measurementMode: 'each',
+    tool: 'orbit', selection: new Set(), pointMode: false, labelMode: false, segmentMode: false, picks: [], overallOffsets: [46, 46, 46], overallVisible: [true, true, true], overallMeta: [{}, {}, {}], measurementMode: 'each',
     answers: false
   };
   let box = G.bounds(state.cells), geometry = G.extractSurface(state.cells), occupied = G.occupancy(state.cells), geometryVersion = 0;
   let frame = null, queued = false, hover = null, pointer = null, spacePressed = false, sceneCache = null;
-  let previewRegion = null, presentation = false, editingSettings = null, dialogDimension = null, dialogLabel = null;
+  let previewRegion = null, presentation = false, editingSettings = null, dialogDimension = null, dialogLabel = null, dialogSegment = null;
   let width = 800, height = 600, history = [], future = [], saveTimer, toastTimer, dimensionSerial = 0;
   let lastBrushClick = null, packedCache = null;
   let sessionReady = false, fileCheckpoint = null, startupDraft = null, recoveryData = null;
@@ -51,6 +51,7 @@
   function applyProject(p) {
     state.cells = p.cells; state.unit = p.unit; state.unitLabel = p.unitLabel;
     state.dimensions = p.dimensions; state.labels = p.labels; state.settings = { ...p.settings };
+    state.points = p.points.map(G.encodePoint); state.segments = p.segments.map(G.encodeSegment);
     state.overallOffsets = p.overallDimensions.map((d) => d.offset); state.overallVisible = p.overallDimensions.map((d) => d.visible);
     state.overallMeta = p.overallDimensions.map(labelMeta);
   }
@@ -58,7 +59,7 @@
   function restore(s) {
     lastBrushClick = null;
     applyProject(G.validateProject(s));
-    state.selection.clear(); state.points = []; previewRegion = null; hover = null;
+    state.selection.clear(); state.picks = []; previewRegion = null; hover = null;
     syncControls(); rebuild();
     // Undo keeps the user's zoom and pan unless the view is following the solid.
     if (state.view.autoFit) fitView(); else requestRender();
@@ -75,6 +76,8 @@
       ...packedCache, dimensions: state.dimensions.map((d) => ({ id: d.id, a: [...d.a], b: [...d.b], offset: d.offset, visible: d.visible !== false, ...labelMeta(d) })),
       overallDimensions: state.overallVisible.map((visible, axis) => ({ id: 'overall-' + axis, visible, offset: state.overallOffsets[axis], ...state.overallMeta[axis] })),
       ...(state.labels.length ? { labels: state.labels.map((l) => ({ id: l.id, at: [...l.at], text: l.text, visible: l.visible !== false })) } : {}),
+      ...(state.points.length ? { points: JSON.parse(JSON.stringify(state.points)) } : {}),
+      ...(state.segments.length ? { segments: JSON.parse(JSON.stringify(state.segments)) } : {}),
       settings: { ...state.settings }, view: { yaw: state.view.yaw, pitch: state.view.pitch, ...(state.view.projection === 'oblique' ? { projection: 'oblique' } : {}) }, measurementMode: state.measurementMode,
       brush: { basis: $('brushBasis').value, size: ['brushX','brushY','brushZ'].map(value), drag: $('dragPaint').checked } };
   }
@@ -111,7 +114,7 @@
     const brushSize = Array.isArray(brush?.size) && brush.size.length === 3 && brush.size.every((v) => Number.isInteger(v) && v >= 1 && v <= 100) ? brush.size : [1,1,1];
     ['brushX','brushY','brushZ'].forEach((id, i) => { $(id).value = brushSize[i]; });
     $('dragPaint').checked = brush?.drag === true; updateBrushControls(); lastBrushClick = null;
-    state.selection.clear(); state.points = []; previewRegion = null; hover = null;
+    state.selection.clear(); state.picks = []; previewRegion = null; hover = null;
     syncControls(); rebuild(); fitView();
     if (keepHistory) scheduleSave();
   }
@@ -123,7 +126,7 @@
   }
 
   function hasContent(data) {
-    return Boolean(data?.dimensions?.length || data?.boxes?.length || data?.blocks?.length || data?.labels?.length);
+    return Boolean(data?.dimensions?.length || data?.boxes?.length || data?.blocks?.length || data?.labels?.length || data?.points?.length || data?.segments?.length);
   }
 
   function updateRecoveryControls() {
@@ -141,7 +144,7 @@
 
   function hasUnsavedWork() {
     return sessionReady && fileCheckpoint !== documentKey() &&
-      (fileCheckpoint !== null || state.cells.size || state.dimensions.length || state.labels.length);
+      (fileCheckpoint !== null || state.cells.size || state.dimensions.length || state.labels.length || state.points.length || state.segments.length);
   }
 
   // The window asks before closing when either the solid or the 2D diagram has unsaved work.
@@ -305,14 +308,26 @@
     return [0, 1, 2].filter((i) => max[i] > min[i]).map((i) => { const a = [...min], b = [...min]; b[i] = max[i]; return { id: 'selected-' + i, a, b, offset: 44, kind: 'selection' }; });
   }
 
+  // Points and segments with their coordinates worked out (on, cross and point ids resolved).
+  let marksCache = null;
+  function resolvedMarks() {
+    const key = JSON.stringify([state.labels, state.points, state.segments]);
+    if (marksCache?.key !== key) {
+      try { marksCache = { key, ...G.resolveMarks(state.labels, state.points, state.segments) }; }
+      catch (error) { marksCache = { key, points: [], segments: [] }; message(error.message, true); }
+    }
+    return marksCache;
+  }
+
   // The canvas draws the same scene as the SVG export. Rebuilt only when something it shows changes.
   function sceneFor(f, fast) {
     const settings = { ...state.settings, overall: state.settings.overall && !state.selection.size };
     const key = [geometryVersion, fast, f.scale, f.cx, f.cy, f.target.join(), f.basis.normal.join(), state.unit, state.unitLabel, state.answers,
-      JSON.stringify([settings, state.dimensions, state.labels, state.overallVisible, state.overallOffsets, state.overallMeta])].join('|');
+      JSON.stringify([settings, state.dimensions, state.labels, state.points, state.segments, state.overallVisible, state.overallOffsets, state.overallMeta])].join('|');
     if (sceneCache?.key === key) return sceneCache.scene;
+    const marks = resolvedMarks();
     const scene = R.buildScene({ cells: state.cells, box, geometry, has: occupied, unit: state.unit, unitLabel: state.unitLabel,
-      dimensions: state.dimensions.map((d) => ({ ...d, kind: 'pinned' })), overallDimensions: overallOptions(), labels: state.labels, settings }, f, { fontSize: 13, fast, answers: state.answers });
+      dimensions: state.dimensions.map((d) => ({ ...d, kind: 'pinned' })), overallDimensions: overallOptions(), labels: state.labels, points: marks.points, segments: marks.segments, settings }, f, { fontSize: 13, fast, answers: state.answers });
     sceneCache = { key, scene };
     return scene;
   }
@@ -351,8 +366,18 @@
     for (const e of selectedEdges()) strokeLine(context, f.project(e.a), f.project(e.b));
     drawBoxPreview(context, previewRegion, f, 'remove');
     if (hover?.region && !pointer?.kind?.startsWith('annotation')) drawBrushPreview(context, hover, f);
-    if ((state.pointMode || state.labelMode) && hover?.point) drawPoint(context, f.project(hover.point), 5, '#35765e');
-    for (const p of state.points) drawPoint(context, f.project(p), 5, '#35765e');
+    if (state.pointMode && hover?.point) drawPoint(context, f.project(hover.point), 5, '#35765e');
+    if (state.segmentMode && state.picks.length && hover?.mark) {
+      context.save(); context.strokeStyle = '#2f8f6a'; context.lineWidth = 1.4; context.setLineDash([5, 4]);
+      strokeLine(context, f.project(state.picks[0].at), f.project(hover.mark.at)); context.restore();
+    }
+    for (const p of state.picks) drawPoint(context, f.project(Array.isArray(p) ? p : p.at), 5, '#35765e');
+    // Where the next point or segment end lands, and what it snapped to (꼭짓점, 교점, 가운데 …).
+    if ((state.labelMode || state.segmentMode) && hover?.mark) {
+      const s = f.project(hover.mark.at);
+      context.save(); context.strokeStyle = '#2f8f6a'; context.lineWidth = 1.6; context.beginPath(); context.arc(s.x, s.y, hover.mark.kind === '면 위' ? 4 : 7, 0, Math.PI * 2); context.stroke();
+      context.font = '11px ' + R.FONT; context.fillStyle = '#2f8f6a'; context.fillText(hover.mark.kind, s.x + 10, s.y - 9); context.restore();
+    }
     const placed = scene.dims.map((d) => ({ ...d.hit }));
     for (const d of selectedDimensions()) {
       const layout = R.dimensionLayout(d, f, box, state.unit, state.unitLabel, { fontSize: 13, placed });
@@ -427,25 +452,74 @@
     updateLabelList();
   }
 
+  const coordText = (p) => p.map((v) => format(v)).join(', ');
+  const STYLE_NAMES = { solid: '실선', dash: '점선', bold: '굵은 선', none: '선 없이 기호만' };
+  // Name of a segment end: the point's name, or its coordinates.
+  function endName(ref) {
+    if (Array.isArray(ref)) return '(' + coordText(ref) + ')';
+    const l = state.labels.find((v) => v.id === ref), pt = state.points.find((v) => v.id === ref);
+    return l ? l.text : pt?.label ?? ref;
+  }
+  function listRow(list, { title, value, warning, open, remove, removeLabel }) {
+    const row = document.createElement('div'); row.className = 'dim-row' + (warning ? ' is-warning' : '');
+    const main = document.createElement('button'); main.type = 'button'; main.className = 'dim-main';
+    const head = document.createElement('span'); head.className = 'dim-title'; head.textContent = title;
+    const text = document.createElement('span'); text.className = 'dim-value'; text.textContent = value;
+    main.append(head, text); main.addEventListener('click', open);
+    const button = document.createElement('button'); button.textContent = '×'; button.setAttribute('aria-label', removeLabel); button.addEventListener('click', remove);
+    row.append(main, button); list.append(row);
+  }
   function updateLabelList() {
-    const list = $('labelList'); list.replaceChildren();
+    const list = $('labelList'), segmentList = $('segmentList'), marks = resolvedMarks(); list.replaceChildren(); segmentList.replaceChildren();
     for (const l of state.labels) {
-      const row = document.createElement('div'); row.className = 'dim-row' + (G.onSurface(occupied, l.at) ? '' : ' is-warning');
-      const main = document.createElement('button'); main.type = 'button'; main.className = 'dim-main';
-      const title = document.createElement('span'); title.className = 'dim-title'; title.textContent = '꼭짓점 (' + l.at.join(', ') + ')' + (G.onSurface(occupied, l.at) ? '' : ' · 도형에 닿지 않음');
-      const text = document.createElement('span'); text.className = 'dim-value'; text.textContent = l.text;
-      main.append(title, text); main.addEventListener('click', () => openLabel(l));
-      const remove = document.createElement('button'); remove.textContent = '×'; remove.setAttribute('aria-label', '꼭짓점 이름 ' + l.text + ' 삭제');
-      remove.addEventListener('click', () => { pushHistory(snapshot()); state.labels = state.labels.filter((v) => v.id !== l.id); updateDimensionList(); requestRender(); scheduleSave(); });
-      row.append(main, remove); list.append(row);
+      const on = G.onSurface(occupied, l.at);
+      listRow(list, { title: '꼭짓점 (' + l.at.join(', ') + ')' + (on ? '' : ' · 도형에 닿지 않음'), value: l.text, warning: !on,
+        open: () => openLabel({ kind: 'label', id: l.id, at: l.at, text: l.text, dot: false }), remove: () => removeMarkPoint(l.id), removeLabel: '꼭짓점 이름 ' + l.text + ' 삭제' });
+    }
+    for (const pt of marks.points) {
+      const off = G.pointPlace(occupied, pt.at) === 'outside', how = pt.def.on ? ' · 두 점 사이' : pt.def.cross ? ' · 교점' : '';
+      listRow(list, { title: '점 (' + coordText(pt.at) + ')' + how + (pt.dot ? ' · ●' : '') + (off ? ' · 도형에 닿지 않음' : ''), value: pt.label ?? '이름 없음', warning: off,
+        open: () => openLabel({ kind: 'point', id: pt.id, at: pt.at, text: pt.label ?? '', dot: pt.dot, labelAt: pt.labelAt }), remove: () => removeMarkPoint(pt.id), removeLabel: '점 ' + (pt.label ?? pt.id) + ' 삭제' });
+    }
+    for (const s of state.segments) {
+      const line = marks.segments.find((v) => v.id === s.id), length = line ? format(G.length(G.sub(line.to, line.from)) * state.unit) + ' ' + state.unitLabel : '';
+      listRow(segmentList, { title: '선분 ' + endName(s.a) + ' – ' + endName(s.b) + ' · ' + STYLE_NAMES[s.style || 'solid'] + (s.ticks ? ' · 같은 길이 ' + s.ticks : ''), value: s.label ? s.label + '  (' + length + ')' : length,
+        open: () => openSegment(s.id), remove: () => { pushHistory(snapshot()); state.segments = state.segments.filter((v) => v.id !== s.id); updateDimensionList(); requestRender(); scheduleSave(); }, removeLabel: '선분 삭제' });
     }
   }
 
-  function openLabel(label) {
-    dialogLabel = label;
-    $('labelText').value = label.text || ''; $('labelError').textContent = '';
-    $('labelDialogDescription').textContent = '꼭짓점 (' + label.at.join(', ') + ')에 붙일 이름입니다. 예: ㄱ, ㄴ, A, B';
+  // The point dialog edits a vertex name (label), a point, or a new point at a clicked spot.
+  function openLabel(target) {
+    dialogLabel = target;
+    $('labelText').value = target.text || ''; $('labelError').textContent = '';
+    $('labelDot').checked = target.kind === 'new' ? true : target.dot === true;
+    $('labelPosition').value = Number.isFinite(target.labelAt) ? String(target.labelAt) : 'auto';
+    if (!$('labelPosition').value) $('labelPosition').value = 'auto';
+    $('labelDialogTitle').textContent = target.kind === 'new' ? '점 찍기 · 이름' : target.kind === 'label' ? '꼭짓점 이름' : '점 · 이름 바꾸기';
+    $('labelDialogDescription').textContent = '위치 (' + coordText(target.at) + ') · 이름 예: ㄱ, ㄴ, A, M. 이름 없이 점만 찍어도 됩니다.';
     $('labelDialog').showModal(); setTimeout(() => { $('labelText').focus(); $('labelText').select(); }, 30);
+  }
+  function nextMarkId(prefix, taken) { let n = 1; while (taken.some((v) => v.id === prefix + n)) n++; return prefix + n; }
+  // Removing a point keeps the segments and derived points that used it, at its coordinates.
+  function removeMarkPoint(id) {
+    const marks = resolvedMarks(), at = [...state.labels, ...marks.points].find((p) => p.id === id)?.at;
+    if (!at) return;
+    pushHistory(snapshot());
+    const swap = (r) => r === id ? [...at] : r;
+    state.segments = state.segments.map((s) => ({ ...s, a: swap(s.a), b: swap(s.b) }));
+    state.points = state.points.filter((p) => p.id !== id).map((p) => {
+      if (!(p.on?.includes(id) || p.cross?.flat().includes(id))) return p;
+      const { on, t, cross, ...rest } = p; return { ...rest, at: [...marks.points.find((q) => q.id === p.id).at] };
+    });
+    state.labels = state.labels.filter((l) => l.id !== id);
+    updateDimensionList(); requestRender(); scheduleSave();
+  }
+  function openSegment(id) {
+    const s = state.segments.find((v) => v.id === id); if (!s) return;
+    dialogSegment = id;
+    $('segmentLabel').value = s.label ?? ''; $('segmentLineStyle').value = s.style || 'solid'; $('segmentBehind').value = s.behind || 'dash'; $('segmentTicks').value = String(s.ticks || 0);
+    $('segmentDialogDescription').textContent = '선분 ' + endName(s.a) + ' – ' + endName(s.b) + '. 도형에 가려지거나 안쪽을 지나는 부분은 기본으로 점선입니다.';
+    $('segmentError').textContent = ''; $('segmentDialog').showModal(); setTimeout(() => $('segmentLabel').focus(), 30);
   }
 
   function setDimensionVisible(id, visible) {
@@ -466,8 +540,8 @@
 
   function setTool(tool) {
     if (state.tool !== tool) lastBrushClick = null;
-    state.tool = tool; state.pointMode = false; state.labelMode = false; state.points = []; hover = null;
-    $('labelModeBtn').classList.remove('active');
+    state.tool = tool; state.pointMode = false; state.labelMode = false; state.segmentMode = false; state.picks = []; hover = null;
+    $('labelModeBtn').classList.remove('active'); $('segmentModeBtn').classList.remove('active');
     document.querySelectorAll('[data-tool]').forEach((el) => el.classList.toggle('active', el.dataset.tool === tool));
     const text = {
       orbit: ['왼쪽 드래그로 회전합니다.\n다른 도구에서도 오른쪽 드래그로 회전해요.', '드래그 회전 · 휠 확대 · Space + 드래그 이동'],
@@ -503,7 +577,7 @@
     $('createError').textContent = '';
     try {
       const size = ['sizeX', 'sizeY', 'sizeZ'].map(value), cells = G.cuboid(size);
-      pushHistory(snapshot()); state.cells = cells; state.dimensions = []; state.overallVisible.fill(true); state.overallOffsets.fill(46); state.selection.clear(); state.points = []; hover = null; previewRegion = null;
+      pushHistory(snapshot()); state.cells = cells; state.dimensions = []; state.overallVisible.fill(true); state.overallOffsets.fill(46); state.selection.clear(); state.picks = []; hover = null; previewRegion = null;
       rebuild(); fitView(); scheduleSave(); message(size.join(' × ') + ' 직육면체를 만들었습니다.');
     } catch (e) { $('createError').textContent = e.message; }
   }
@@ -591,7 +665,8 @@
 
   function hoverAt(p) {
     const hit = hitAt(p); $('pointerInfo').textContent = hit ? 'X ' + hit.cell[0] + ' / Y ' + hit.cell[1] + ' / Z ' + hit.cell[2] : 'X — / Y — / Z —';
-    if (state.pointMode || state.labelMode) hover = { point: snapPoint(p) };
+    if (state.pointMode) hover = { point: snapPoint(p) };
+    else if (state.labelMode || state.segmentMode) hover = { mark: snapMark(p) };
     else if (state.tool === 'add' || state.tool === 'remove') {
       const target = hit || (state.tool === 'add' ? groundHit(p) : null);
       try { if (target) showBrushPreview(target, brushOptions(), state.tool); else { hover = null; resetBrushStatus(); } }
@@ -645,6 +720,46 @@
     const hit = hitAt(p); return hit ? hit.point.map(Math.round) : null;
   }
 
+  // Where a point or a segment end lands, in this order: an existing point › a corner › where two
+  // segments cross › the middle of an edge or segment › a step along one › a step on a face.
+  // Hidden corners count only while hidden edges are drawn dashed.
+  function snapMark(p) {
+    if (!frame) return null;
+    const step = Number($('markStep').value) || .5, marks = resolvedMarks();
+    const distance = (q) => { const s = frame.project(q); return Math.hypot(s.x - p.x, s.y - p.y); };
+    const tidy = (q) => q.map((v) => Number(v.toFixed(6)));
+    let best = null;
+    const consider = (candidate, radius) => { const d = distance(candidate.at); if (d < radius && (!best || d < best.d)) best = { ...candidate, d }; };
+    for (const l of state.labels) consider({ ref: l.id, at: l.at, kind: '점 ' + l.text }, 12);
+    for (const pt of marks.points) consider({ ref: pt.id, at: pt.at, kind: '점 ' + (pt.label ?? pt.id) }, 12);
+    if (best) return best;
+    const edges = state.settings.hidden ? geometry.edges : frame.screenEdges;
+    for (const e of edges) for (const q of [e.a, e.b]) consider({ at: [...q], kind: '꼭짓점' }, 11);
+    for (const s of marks.segments) for (const q of [s.from, s.to]) consider({ at: [...q], kind: '선분 끝' }, 11);
+    if (best) return best;
+    const lines = [...edges.map((e) => [e.a, e.b, '모서리']), ...marks.segments.map((s) => [s.from, s.to, '선분'])];
+    const within = (a, b, q) => { const v = G.sub(b, a), t = G.dot(G.sub(q, a), v) / G.dot(v, v); return t > -1e-6 && t < 1 + 1e-6; };
+    for (let i = 0; i < lines.length; i++) for (let j = i + 1; j < lines.length; j++) {
+      if (lines[i][2] === '모서리' && lines[j][2] === '모서리') continue;
+      const q = G.lineCross(lines[i][0], lines[i][1], lines[j][0], lines[j][1]);
+      if (q && within(lines[i][0], lines[i][1], q) && within(lines[j][0], lines[j][1], q)) consider({ at: tidy(q), kind: '교점' }, 11);
+    }
+    if (best) return best;
+    for (const [a, b, name] of lines) consider({ at: tidy(G.mul(G.add(a, b), .5)), kind: name + ' 가운데' }, 10);
+    if (best) return best;
+    for (const [a, b, name] of lines) {
+      const sa = frame.project(a), sb = frame.project(b), { t } = distanceToSegment(p, sa, sb), v = G.sub(b, a);
+      // Along an edge the point steps on the grid (1, ½ or ¼ of a block); along a segment, by length.
+      const total = G.length(v), along = Math.round(t * total / step) * step / total, u = Math.max(0, Math.min(1, along));
+      consider({ at: tidy(G.add(a, G.mul(v, u))), kind: name + ' 위' }, 10);
+    }
+    if (best) return best;
+    const hit = hitAt(p);
+    if (!hit) return null;
+    const axis = hit.normal.findIndex((v) => v !== 0);
+    return { at: tidy(hit.point.map((v, i) => i === axis ? Math.round(v) : Math.round(v / step) * step)), kind: '면 위' };
+  }
+
   function hitDimension(p) { return (frame?.dimensions || []).slice().reverse().find((d) => p.x >= d.hit.x && p.x <= d.hit.x + d.hit.w && p.y >= d.hit.y && p.y <= d.hit.y + d.hit.h); }
 
   function pinSelected() {
@@ -656,17 +771,35 @@
     updateSelection(); updateDimensionList(); scheduleSave(); message('치수선을 고정했습니다. 숫자를 더블클릭해 수정할 수 있어요.');
   }
 
+  function markClick(p) {
+    const q = snapMark(p); if (!q) { message('도형의 꼭짓점·모서리·면 위를 눌러 주세요.'); return; }
+    const marks = resolvedMarks(), label = state.labels.find((l) => l.id === q.ref), pt = marks.points.find((v) => v.id === q.ref);
+    if (label) openLabel({ kind: 'label', id: label.id, at: label.at, text: label.text, dot: false });
+    else if (pt) openLabel({ kind: 'point', id: pt.id, at: pt.at, text: pt.label ?? '', dot: pt.dot, labelAt: pt.labelAt });
+    else openLabel({ kind: 'new', at: q.at, text: '' });
+  }
+
+  function segmentClick(p) {
+    const q = snapMark(p); if (!q) { message('도형의 꼭짓점·모서리·면 위를 눌러 주세요.'); return; }
+    if (!state.picks.length) { state.picks = [q]; $('pointHint').textContent = '선분의 끝점을 누르세요. 꼭짓점·교점·모서리 가운데에 붙어요.'; requestRender(); return; }
+    const first = state.picks[0];
+    if (G.length(G.sub(first.at, q.at)) < 1e-9) { message('첫 점과 다른 점을 골라 주세요.'); return; }
+    if (state.segments.length >= 200) { message('선분은 200개까지입니다.', true); return; }
+    pushHistory(snapshot());
+    state.segments = [...state.segments, { id: nextMarkId('s', state.segments), a: first.ref ?? [...first.at], b: q.ref ?? [...q.at], style: $('segmentStyle').value, behind: 'dash', visible: true }];
+    state.picks = []; $('pointHint').textContent = '다음 선분의 첫 점을 누르세요. Escape로 종료합니다.';
+    updateDimensionList(); requestRender(); scheduleSave(); message('선분을 그었습니다. 목록에서 누르면 기호(㉠)·같은 길이 표시·모양을 바꿀 수 있어요.');
+  }
+
   function pointClick(p) {
+    if (state.labelMode) { markClick(p); return; }
+    if (state.segmentMode) { segmentClick(p); return; }
     const q = snapPoint(p); if (!q) { message('도형의 꼭짓점이나 격자 교차점을 눌러 주세요.'); return; }
-    if (state.labelMode) {
-      const existing = state.labels.find((l) => G.length(G.sub(l.at, q)) === 0);
-      openLabel(existing || { id: null, at: q, text: '' }); return;
-    }
-    if (!state.points.length) { state.points = [q]; $('pointHint').textContent = '두 번째 점을 선택하세요. 같은 축의 두 점은 길이 수정도 가능합니다.'; requestRender(); return; }
-    if (G.length(G.sub(state.points[0], q)) === 0) { message('첫 번째 점과 다른 점을 골라 주세요.'); return; }
+    if (!state.picks.length) { state.picks = [q]; $('pointHint').textContent = '두 번째 점을 선택하세요. 같은 축의 두 점은 길이 수정도 가능합니다.'; requestRender(); return; }
+    if (G.length(G.sub(state.picks[0], q)) === 0) { message('첫 번째 점과 다른 점을 골라 주세요.'); return; }
     if (state.dimensions.length >= 200) { message('고정 치수는 200개까지입니다.', true); return; }
-    pushHistory(snapshot()); state.dimensions.push({ id: 'dim-' + (++dimensionSerial) + '-' + Date.now(), a: state.points[0], b: q, offset: 44, visible: true });
-    state.settings.annotations = true; $('showDimensions').checked = true; state.points = [];
+    pushHistory(snapshot()); state.dimensions.push({ id: 'dim-' + (++dimensionSerial) + '-' + Date.now(), a: state.picks[0], b: q, offset: 44, visible: true });
+    state.settings.annotations = true; $('showDimensions').checked = true; state.picks = [];
     $('pointHint').textContent = '첫 번째 점을 선택하세요. Escape로 종료합니다.';
     updateDimensionList(); requestRender(); scheduleSave(); message('두 점 사이의 실제 길이를 표시했습니다.');
   }
@@ -744,9 +877,10 @@
     else if (e.button === 2 || e.altKey) pointer = { kind: 'orbit', start: p, yaw: state.view.yaw, pitch: state.view.pitch, id: e.pointerId };
     else if (e.button === 0) {
       const dimension = hitDimension(p);
-      if (dimension && !dimension.textStyle && !state.pointMode && !state.labelMode) pointer = { kind: 'annotation', start: p, dimension, original: snapshot(), moved: false, id: e.pointerId };
+      const picking = state.pointMode || state.labelMode || state.segmentMode;
+      if (dimension && !dimension.textStyle && !picking) pointer = { kind: 'annotation', start: p, dimension, original: snapshot(), moved: false, id: e.pointerId };
       else if (state.tool === 'orbit') pointer = { kind: 'orbit', start: p, yaw: state.view.yaw, pitch: state.view.pitch, id: e.pointerId };
-      else if (state.tool === 'measure') pointer = { kind: state.pointMode || state.labelMode ? 'point' : 'select', start: p, end: p, shift: e.shiftKey, id: e.pointerId };
+      else if (state.tool === 'measure') pointer = { kind: picking ? 'point' : 'select', start: p, end: p, shift: e.shiftKey, id: e.pointerId };
       else {
         try {
           const options=brushOptions(), signature=options.basis+':'+options.size.join(',');
@@ -834,7 +968,12 @@
   function openDimension(d) {
     const changedAxes = G.sub(d.b, d.a).map((v, i) => v ? i : -1).filter((i) => i >= 0);
     if (changedAxes.length !== 1) { message('사선은 거리 측정만 가능합니다. 도형을 바꾸려면 X·Y·Z 중 한 축의 치수를 선택해 주세요.', true); return; }
-    dialogDimension = { ...d, axis: changedAxes[0] };
+    // A number double-clicked on the canvas is a drawn layout whose "label" is the printed text
+    // ("6 cm"); the dialog edits the dimension's own label and question flag instead.
+    const { label, question, questionMark, answer, ...shape } = d;
+    const own = d.kind === 'overall' ? state.overallMeta[d.axis] || {} : labelMeta(state.dimensions.find((v) => v.id === d.id) || d);
+    dialogDimension = { ...shape, ...own, axis: changedAxes[0] };
+    d = dialogDimension;
     $('dimensionValue').value = Number(physicalLength(d).toFixed(5)); $('dimensionValue').step = 'any'; $('dimensionValue').min = state.unit;
     $('dimensionDialogDescription').textContent = axisNames[dialogDimension.axis] + ' 방향의 ' + labelOf(d) + '를 수정합니다. 이 구간과 연결된 면을 이동합니다.';
     $('dimensionGridHint').textContent = '한 칸 ' + format(state.unit) + state.unitLabel + '의 배수로 입력하세요. 파낸 부분도 이 축을 따라 늘거나 줄며, 작은 부분은 격자에 맞춰 바뀔 수 있습니다.';
@@ -865,7 +1004,8 @@
         state.cells = result.cells;
         state.dimensions = state.dimensions.map((v) => ({ ...v, a: result.mapPoint(v.a), b: result.mapPoint(v.b) })).filter((v) => G.length(G.sub(v.b, v.a)) > 0);
         state.labels = state.labels.map((l) => ({ ...l, at: result.mapPoint(l.at) }));
-        state.selection.clear(); state.points = []; hover = null; previewRegion = null;
+        ({ points: state.points, segments: state.segments } = G.mapMarks({ points: state.points, segments: state.segments }, result.mapFree));
+        state.selection.clear(); state.picks = []; hover = null; previewRegion = null;
       }
       rebuild(); if (result) fitView(); scheduleSave(); $('dimensionDialog').close();
       message(result ? axisNames[d.axis] + ' 치수와 실제 도형을 ' + format(newLength) + state.unitLabel + '로 바꿨습니다.' : '치수 표시를 바꿨습니다.');
@@ -890,18 +1030,37 @@
 
   $('labelForm').addEventListener('submit', (e) => {
     e.preventDefault();
-    const l = dialogLabel, text = $('labelText').value.trim(); if (!l) return;
-    if (!text || text.length > 12) { $('labelError').textContent = '이름은 1~12자로 입력해 주세요.'; return; }
+    const target = dialogLabel, text = $('labelText').value.trim(), dot = $('labelDot').checked, angle = $('labelPosition').value; if (!target) return;
+    if (text.length > 12) { $('labelError').textContent = '이름은 12자 이내로 입력해 주세요.'; return; }
+    if (!text && !dot) { $('labelError').textContent = '이름을 쓰거나 점 찍기를 켜 주세요.'; return; }
     pushHistory(snapshot());
-    if (l.id) state.labels = state.labels.map((v) => v.id === l.id ? { ...v, text } : v);
-    else {
-      let n = state.labels.length + 1; while (state.labels.some((v) => v.id === 'label-' + n)) n++;
-      state.labels = [...state.labels, { id: 'label-' + n, at: [...l.at], text, visible: true }];
-    }
-    state.settings.labels = true; syncControls();
-    $('labelDialog').close(); updateDimensionList(); requestRender(); scheduleSave();
+    const fields = { ...(text ? { label: text } : {}), dot, ...(angle !== 'auto' ? { labelAt: Number(angle) } : {}), visible: true };
+    // A plain vertex name stays a name (older files keep working); a dot or a position makes it a point.
+    if (target.kind === 'label' && !dot && angle === 'auto') state.labels = state.labels.map((v) => v.id === target.id ? { ...v, text } : v);
+    else if (target.kind === 'label') { state.labels = state.labels.filter((v) => v.id !== target.id); state.points = [...state.points, { id: target.id, at: [...target.at], ...fields }]; }
+    else if (target.kind === 'point') state.points = state.points.map((v) => { if (v.id !== target.id) return v; const { label, dot: _dot, labelAt, visible, ...where } = v; return { ...where, ...fields }; });
+    else state.points = [...state.points, { id: nextMarkId('P', [...state.labels, ...state.points]), at: [...target.at], ...fields }];
+    if (text) state.settings.labels = true;
+    syncControls(); $('labelDialog').close(); updateDimensionList(); requestRender(); scheduleSave();
   });
   $('cancelLabelBtn').addEventListener('click', () => $('labelDialog').close());
+  $('segmentForm').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const label = $('segmentLabel').value.trim(), ticks = Number($('segmentTicks').value);
+    if (label.length > 30) { $('segmentError').textContent = '기호는 30자 이내로 입력해 주세요.'; return; }
+    pushHistory(snapshot());
+    state.segments = state.segments.map((v) => {
+      if (v.id !== dialogSegment) return v;
+      const { label: _label, ticks: _ticks, ...rest } = v;
+      return { ...rest, style: $('segmentLineStyle').value, behind: $('segmentBehind').value, ...(label ? { label } : {}), ...(ticks ? { ticks } : {}) };
+    });
+    $('segmentDialog').close(); updateDimensionList(); requestRender(); scheduleSave();
+  });
+  $('cancelSegmentBtn').addEventListener('click', () => $('segmentDialog').close());
+  $('removeSegmentBtn').addEventListener('click', () => {
+    pushHistory(snapshot()); state.segments = state.segments.filter((v) => v.id !== dialogSegment);
+    $('segmentDialog').close(); updateDimensionList(); requestRender(); scheduleSave();
+  });
 
   async function download(blob, name) {
     if (desktop) {
@@ -1022,12 +1181,12 @@
   for(const id of ['brushX','brushY','brushZ'])$(id).addEventListener('change',()=>{lastBrushClick=null;hover=null;resetBrushStatus();requestRender();scheduleSave();});
   $('twoPointBtn').addEventListener('click', () => {
     if (state.pointMode) { setTool('measure'); return; }
-    setTool('measure'); state.pointMode = true; state.selection.clear(); state.points = [];
+    setTool('measure'); state.pointMode = true; state.selection.clear(); state.picks = [];
     $('twoPointBtn').classList.add('active'); $('pointHint').textContent = '첫 번째 점을 선택하세요. Escape로 종료합니다.'; $('pointHint').style.display = 'block'; updateSelection();
   });
   $('pinDimensionBtn').addEventListener('click', pinSelected);
   $('measurementMode').addEventListener('change', () => { state.measurementMode = $('measurementMode').value; updateSelection(); scheduleSave(); });
-  $('clearSelectionBtn').addEventListener('click', () => { state.selection.clear(); state.points = []; updateSelection(); });
+  $('clearSelectionBtn').addEventListener('click', () => { state.selection.clear(); state.picks = []; updateSelection(); });
   $('showAllDimensionsBtn').addEventListener('click', () => setAllDimensionsVisible(true));
   $('hideAllDimensionsBtn').addEventListener('click', () => setAllDimensionsVisible(false));
   const settingInputs = { showGrid: 'grid', showFloor: 'floor', showOverall: 'overall', showDimensions: 'annotations', showHidden: 'hidden', showLabels: 'labels' };
@@ -1036,9 +1195,15 @@
   $('showAnswers').addEventListener('change', () => { state.answers = $('showAnswers').checked; requestRender(); });
   $('labelModeBtn').addEventListener('click', () => {
     if (state.labelMode) { setTool('measure'); return; }
-    setTool('measure'); state.labelMode = true; state.selection.clear(); state.points = [];
-    $('labelModeBtn').classList.add('active'); $('pointHint').textContent = '이름을 붙일 꼭짓점을 누르세요. Escape로 종료합니다.'; $('pointHint').style.display = 'block'; updateSelection();
+    setTool('measure'); state.labelMode = true; state.selection.clear(); state.picks = [];
+    $('labelModeBtn').classList.add('active'); $('pointHint').textContent = '점을 찍을 곳(꼭짓점·모서리 위·가운데·교점·면 위)을 누르세요. Escape로 종료합니다.'; $('pointHint').style.display = 'block'; updateSelection();
   });
+  $('segmentModeBtn').addEventListener('click', () => {
+    if (state.segmentMode) { setTool('measure'); return; }
+    setTool('measure'); state.segmentMode = true; state.selection.clear(); state.picks = [];
+    $('segmentModeBtn').classList.add('active'); $('pointHint').textContent = '선분의 첫 점을 누르세요. 꼭짓점끼리 잇거나 모서리 위·가운데에서 시작할 수 있어요.'; $('pointHint').style.display = 'block'; updateSelection();
+  });
+  $('markStep').addEventListener('change', () => { hover = null; requestRender(); });
   $('presentationBtn').addEventListener('click', () => {
     presentation = !presentation;
     if (presentation) { editingSettings = { grid: state.settings.grid, floor: state.settings.floor }; state.settings.grid = false; state.settings.floor = false; state.selection.clear(); setTool('orbit'); }
@@ -1074,7 +1239,7 @@
   });
   $('exportSvgBtn').addEventListener('click', exportSvg); $('exportPngBtn').addEventListener('click', exportPng); $('exportPairBtn').addEventListener('click', exportSvgPair); $('copySvgBtn').addEventListener('click', copySvg);
   const toolFolder = desktop ? '설치 폴더의 resources\\app.asar.unpacked (보통 %LOCALAPPDATA%\\Programs\\SolidLab\\resources\\app.asar.unpacked)' : '이 앱 폴더';
-  const aiPrompt = '첨부한 입체도형 JSON을 읽고 실제 크기, 치수선별 길이와 숨김 상태를 확인해 줘. 수정 요청이 있으면 원본은 보존하고 새 JSON 파일로 만들어 줘.\n\nSolidLab 도구는 ' + toolFolder + '에 있어. 그 폴더의 AI_도형_연동.md를 먼저 읽고 node model-tools.cjs를 써. 순서는 inspect → 수정 → check(경고 확인) → views(앞·옆·위 모양 확인) → render. 길이를 묻는 문제는 ask로 그 치수를 "?"로 바꾸고, sheet 명령으로 확인 PNG와 문제·정답 SVG를 한 번에 만들 수 있어.\n\n그림은 node model-tools.cjs render "도형.json" "확인.png"로 PNG를 만들어 직접 눈으로 확인하고, 학습지에 넣을 SVG는 --preset worksheet로 만들어. 실제 길이는 칸 수 × unit이야. 치수 숫자 대신 실제 형상을 고치고, 요청하지 않은 숨김·격자 설정은 유지해.';
+  const aiPrompt = '첨부한 입체도형 JSON을 읽고 실제 크기, 치수선별 길이와 숨김 상태를 확인해 줘. 수정 요청이 있으면 원본은 보존하고 새 JSON 파일로 만들어 줘.\n\nSolidLab 도구는 ' + toolFolder + '에 있어. 그 폴더의 AI_도형_연동.md를 먼저 읽고 node model-tools.cjs를 써. 순서는 inspect → 수정 → check(경고 확인) → views(앞·옆·위 모양 확인) → render. 길이를 묻는 문제는 ask로 그 치수를 "?"로 바꾸고, sheet 명령으로 확인 PNG와 문제·정답 SVG를 한 번에 만들 수 있어. 꼭짓점 표시(점)·이름·모서리 가운데 점·교점은 point, 꼭짓점 잇기·대각선·보조선과 선분 기호(㉠)·같은 길이 표시는 segment로 넣어(가려진 부분은 자동 점선).\n\n그림은 node model-tools.cjs render "도형.json" "확인.png"로 PNG를 만들어 직접 눈으로 확인하고, 학습지에 넣을 SVG는 --preset worksheet로 만들어. 실제 길이는 칸 수 × unit이야. 치수 숫자 대신 실제 형상을 고치고, 요청하지 않은 숨김·격자 설정은 유지해.';
   $('aiHelpBtn').addEventListener('click', () => { $('aiPrompt').value = aiPrompt; $('aiCopyStatus').textContent = ''; $('aiDialog').showModal(); });
   $('closeAiBtn').addEventListener('click', () => $('aiDialog').close());
   $('copyAiPromptBtn').addEventListener('click', async () => {
@@ -1162,6 +1327,8 @@
   }
   initReference('solid', 'solidReference');
   initReference('diagram', 'diagramReference');
+  // The version chip shows which build is running; the installed app also says it is installed.
+  if (desktop) { $('appVersion').textContent += ' · 설치판'; $('footerVersion').textContent = $('footerVersion').textContent.replace('설치 없이 HTML 열기', '설치판'); }
   window.SolidLabShell = { desktop, message, download, updateDirty: updateDesktopDirty };
   resizeObserver.observe($('canvasWrap')); syncControls(); rebuild(); updateHistory(); updateBrushControls(); setTool('orbit'); prepareStartup();
 })();

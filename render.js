@@ -4,8 +4,8 @@
   const format = (v) => Number(v.toFixed(5)).toLocaleString('ko-KR', { maximumFractionDigits: 5 });
   const FONT = "'Malgun Gothic','Apple SD Gothic Neo','Noto Sans KR','Segoe UI',sans-serif";
   const PALETTES = {
-    color: { top: '#e3edde', bottom: '#a4bfa8', x: '#cbdbc8', y: '#b7ceb7', edge: '#34503a', edgeWidth: 1.5, grid: '#7d977a', gridWidth: .6, hidden: '#34503a', hiddenWidth: 1, dash: '4 3', floor: '#d9e2d5', dim: '#5f7562', dimWidth: .9, dimDash: '4 3', text: '#243a2a', answer: '#b3261e', arrows: false },
-    print: { top: '#ffffff', bottom: '#b3b3b3', x: '#d4d4d4', y: '#ececec', edge: '#000000', edgeWidth: 1.5, grid: '#000000', gridWidth: .7, hidden: '#000000', hiddenWidth: 1, dash: '4 3', floor: '#cfcfcf', dim: '#000000', dimWidth: .8, dimDash: '', text: '#000000', answer: '#b3261e', arrows: true }
+    color: { top: '#e3edde', bottom: '#a4bfa8', x: '#cbdbc8', y: '#b7ceb7', edge: '#34503a', edgeWidth: 1.5, grid: '#7d977a', gridWidth: .6, hidden: '#34503a', hiddenWidth: 1, dash: '4 3', floor: '#d9e2d5', dim: '#5f7562', dimWidth: .9, dimDash: '4 3', text: '#243a2a', answer: '#b3261e', arrows: false, aux: '#34503a', auxWidth: 1.3, boldWidth: 2.8, auxDash: '5 3' },
+    print: { top: '#ffffff', bottom: '#b3b3b3', x: '#d4d4d4', y: '#ececec', edge: '#000000', edgeWidth: 1.5, grid: '#000000', gridWidth: .7, hidden: '#000000', hiddenWidth: 1, dash: '4 3', floor: '#cfcfcf', dim: '#000000', dimWidth: .8, dimDash: '', text: '#000000', answer: '#b3261e', arrows: true, aux: '#000000', auxWidth: 1.3, boldWidth: 2.8, auxDash: '5 3' }
   };
   const faceFill = (n, pal) => n[2] > 0 ? pal.top : n[2] < 0 ? pal.bottom : n[0] !== 0 ? pal.x : pal.y;
   const faceColor = (n) => faceFill(n, PALETTES.color);
@@ -108,6 +108,25 @@
     }
     return false;
   }
+  // Seen and hidden stretches of any straight line a→b, as [t0, t1, seen] (t from 0 to 1).
+  function visibleParts(a, b, seenAt, f, fast) {
+    const at = (t) => a.map((v, i) => v + (b[i] - v) * t);
+    // A ray can graze a cube's corner line at a single point; two of three nearby samples decide.
+    const seen = (t) => seenAt(at(t)) + seenAt(at(Math.max(0, t - .003))) + seenAt(at(Math.min(1, t + .003))) >= 2;
+    const pa = f.project(a), pb = f.project(b), screen = Math.hypot(pb.x - pa.x, pb.y - pa.y);
+    const count = fast ? 3 : Math.max(3, Math.min(64, Math.ceil(screen / 3)));
+    const ts = [.004, ...Array.from({ length: count }, (_, i) => (i + .5) / count), .996], parts = [];
+    let state = seen(ts[0]), from = 0;
+    for (let i = 1; i < ts.length; i++) {
+      const next = seen(ts[i]);
+      if (next === state) continue;
+      let x = ts[i - 1], y = ts[i];
+      for (let k = 0; k < 12; k++) { const m = (x + y) / 2; if (seen(m) === state) x = m; else y = m; }
+      parts.push([from, (x + y) / 2, state]); from = (x + y) / 2; state = next;
+    }
+    parts.push([from, 1, state]);
+    return parts;
+  }
 
   // --- Text metrics -----------------------------------------------------------------------
   function textWidth(text, size) {
@@ -200,7 +219,7 @@
   function buildScene(model, f, options = {}) {
     const settings = model.settings, pal = PALETTES[settings.style] || PALETTES.color;
     const cells = model.cells, box = model.box !== undefined ? model.box : G.bounds(cells);
-    const scene = { palette: pal, gridOn: settings.grid, floor: [], partial: [], regions: [], hidden: [], edges: [], dims: [], labels: [], fontSize: options.fontSize ?? 13 };
+    const scene = { palette: pal, gridOn: settings.grid, floor: [], partial: [], regions: [], hidden: [], edges: [], lines: [], dims: [], dots: [], labels: [], fontSize: options.fontSize ?? 13 };
     if (!box) return scene;
     const geometry = model.geometry || G.extractSurface(cells), has = model.has || G.occupancy(cells);
     const d = f.basis.normal, fast = options.fast === true;
@@ -325,12 +344,23 @@
       }
     }
 
+    // Auxiliary segments (꼭짓점 잇기·보조선): stretches behind or inside the solid are dashed.
+    const seenAt = (p) => !occluded(p, d, has, box), auxLines = [];
+    for (const s of model.segments || []) {
+      if (s.visible === false) continue;
+      const ends = [f.project(s.from), f.project(s.to)], piece = ([t0, t1]) => [0, 1].map((k) => { const t = k ? t1 : t0; return f.project(s.from.map((v, i) => v + (s.to[i] - v) * t)); });
+      const parts = s.behind === 'same' ? [[0, 1, true]] : visibleParts(s.from, s.to, seenAt, f, fast);
+      scene.lines.push({ id: s.id, style: s.style, behind: s.behind, ticks: s.ticks || 0, ends, from: s.from, to: s.to,
+        seen: parts.filter((q) => q[2]).map(piece), hidden: parts.filter((q) => !q[2]).map(piece) });
+      if (s.style !== 'none') auxLines.push(ends);
+    }
+
     // Dimensions, then vertex names; later labels step away from earlier ones.
     const placed = [], unitLabel = model.unitLabel || 'cm', size = scene.fontSize;
     // Screen point → does the solid cover it? Used to keep numbers and names off the faces.
     const covers = (pt) => { const r = f.ray(pt); return !!G.raycast(cells, box, r.origin, r.direction); };
     scene.covers = covers;
-    const placedLines = [], hidden3d = (p) => occluded(p, d, has, box);
+    const placedLines = [], hidden3d = (p) => !seenAt(p);
     const dimOptions = { fontSize: size, answers: options.answers, dimStyle: settings.dimStyle, offsetScale: options.offsetScale ?? 1, placed, placedLines, covers, hidden3d };
     const overall = settings.overall ? G.overallDimensions(box, model.overallDimensions, has, f.basis) : [];
     const pinned = settings.annotations ? (model.dimensions || []).map((v) => ({ ...v, kind: v.kind || 'pinned' })) : [];
@@ -340,29 +370,55 @@
       const layout = dimensionLayout(dim, f, box, model.unit, unitLabel, dimOptions);
       if (layout) scene.dims.push(layout);
     }
-    if (settings.labels) {
-      const center = f.project(box.center), labelSize = Math.round(size * 1.15);
-      for (const l of model.labels || []) {
-        if (l.visible === false) continue;
-        const p = f.project(l.at), w = textWidth(l.text, labelSize) + 2, h = labelSize * 1.2;
-        let dx = p.x - center.x, dy = p.y - center.y; const len = Math.hypot(dx, dy) || 1; dx /= len; dy /= len;
-        if (Math.hypot(p.x - center.x, p.y - center.y) < 1) { dx = 0; dy = -1; }
-        let best = null, anyOff = false;
-        for (const turn of [0, .5, -.5, 1, -1, 1.6, -1.6, 2.3, -2.3, Math.PI]) {
-          const ux = dx * Math.cos(turn) - dy * Math.sin(turn), uy = dx * Math.sin(turn) + dy * Math.cos(turn);
-          const reach = 5 + Math.abs(ux) * w / 2 + Math.abs(uy) * h / 2;
-          const x = p.x + ux * reach, y = p.y + uy * reach, hit = { x: x - w / 2, y: y - h / 2, w, h };
-          const onShape = [[x, y], [hit.x, hit.y], [hit.x + w, hit.y], [hit.x, hit.y + h], [hit.x + w, hit.y + h]].some(([px, py]) => covers({ x: px, y: py }));
-          if (!onShape) anyOff = true;
-          const clash = placed.some((r) => rectsOverlap(r, hit)) || placedLines.some(([s, t]) => segmentHitsRect(s, t, hit));
-          const score = (clash ? 2 : 0) + (onShape ? 1 : 0);
-          if (!best || score < best.score) best = { score, label: { ...l, x, y, fontSize: labelSize, hit, anchor: p, onShape } };
-          if (score === 0) break;
-        }
-        // A vertex inside the outline has faces all around; a name on a face is then expected.
-        best.label.onShape = best.label.onShape && anyOff;
-        placed.push(best.label.hit); scene.labels.push(best.label);
+    const center = f.project(box.center), labelSize = Math.round(size * 1.15), nearLines = [...placedLines, ...auxLines];
+    // A name steps around its point, outward from the solid (or toward labelAt degrees) first.
+    const placeName = (l, text, at, angle) => {
+      const p = f.project(at), w = textWidth(text, labelSize) + 2, h = labelSize * 1.2;
+      let dx = p.x - center.x, dy = p.y - center.y; const len = Math.hypot(dx, dy) || 1; dx /= len; dy /= len;
+      if (Math.hypot(p.x - center.x, p.y - center.y) < 1) { dx = 0; dy = -1; }
+      if (Number.isFinite(angle)) { dx = Math.cos(angle * Math.PI / 180); dy = -Math.sin(angle * Math.PI / 180); }
+      let best = null, anyOff = false;
+      for (const turn of [0, .5, -.5, 1, -1, 1.6, -1.6, 2.3, -2.3, Math.PI]) {
+        const ux = dx * Math.cos(turn) - dy * Math.sin(turn), uy = dx * Math.sin(turn) + dy * Math.cos(turn);
+        const reach = 5 + Math.abs(ux) * w / 2 + Math.abs(uy) * h / 2;
+        const x = p.x + ux * reach, y = p.y + uy * reach, hit = { x: x - w / 2, y: y - h / 2, w, h };
+        const onShape = [[x, y], [hit.x, hit.y], [hit.x + w, hit.y], [hit.x, hit.y + h], [hit.x + w, hit.y + h]].some(([px, py]) => covers({ x: px, y: py }));
+        if (!onShape) anyOff = true;
+        const clash = placed.some((r) => rectsOverlap(r, hit)) || nearLines.some(([s, t]) => segmentHitsRect(s, t, hit));
+        const score = (clash ? 2 : 0) + (onShape ? 1 : 0);
+        if (!best || score < best.score) best = { score, label: { ...l, text, at, x, y, fontSize: labelSize, hit, anchor: p, onShape } };
+        if (score === 0) break;
       }
+      // A vertex inside the outline has faces all around; a name on a face is then expected.
+      best.label.onShape = best.label.onShape && anyOff;
+      placed.push(best.label.hit); scene.labels.push(best.label);
+    };
+    if (settings.labels) for (const l of model.labels || []) if (l.visible !== false) placeName(l, l.text, l.at);
+    // Points: a dot marks the vertex (꼭짓점 표시); its name follows the vertex-name setting.
+    for (const pt of model.points || []) {
+      if (pt.visible === false) continue;
+      if (pt.dot !== false) { const s = f.project(pt.at); scene.dots.push({ id: pt.id, x: s.x, y: s.y, r: Math.max(2, size * .18) }); }
+      if (settings.labels && pt.label !== undefined) placeName({ id: pt.id, kind: 'point' }, pt.label, pt.at, pt.labelAt);
+    }
+    // A segment's symbol (㉠, a, 6 cm) sits beside its middle; on a face that is expected.
+    for (const line of scene.lines) {
+      const s = (model.segments || []).find((v) => v.id === line.id);
+      if (s?.label === undefined) continue;
+      const [a, b] = line.ends, dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy) || 1, mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+      let n = [-dy / len, dx / len];
+      if ((mid.x - center.x) * n[0] + (mid.y - center.y) * n[1] < 0) n = n.map((v) => -v);
+      const w = textWidth(s.label, size) + size * .5, h = size * 1.35, extent = Math.abs(n[0]) * w / 2 + Math.abs(n[1]) * h / 2;
+      let best = null;
+      for (const along of [0, -.2, .2]) for (let attempt = 0; attempt < 4; attempt++) for (const side of [1, -1]) {
+        const off = size * .3 + extent + attempt * size * .8, x = mid.x + dx * along + n[0] * side * off, y = mid.y + dy * along + n[1] * side * off;
+        const hit = { x: x - w / 2, y: y - h / 2, w, h };
+        const onShape = [[x, y], [hit.x, hit.y], [hit.x + w, hit.y], [hit.x, hit.y + h], [hit.x + w, hit.y + h]].some(([px, py]) => covers({ x: px, y: py }));
+        // Staying next to its own segment matters more than keeping clear of a thin crossing line.
+        const crossed = nearLines.filter(([p, q]) => segmentHitsRect(p, q, hit)).length, onDot = scene.dots.some((t) => t.x > hit.x - t.r && t.x < hit.x + w + t.r && t.y > hit.y - t.r && t.y < hit.y + h + t.r);
+        const score = (placed.some((r) => rectsOverlap(r, hit)) ? 3 : 0) + crossed * .45 + (onDot ? 1 : 0) + (onShape ? .2 : 0) + (side < 0 ? .1 : 0) + attempt * .35 + Math.abs(along) * 1.5;
+        if (!best || score < best.score) best = { score, label: { id: s.id, kind: 'segment', text: s.label, x, y, fontSize: size, weight: 500, hit, anchor: mid, onShape: false } };
+      }
+      placed.push(best.label.hit); scene.labels.push(best.label);
     }
     return scene;
   }
@@ -374,6 +430,8 @@
     for (const face of scene.partial) face.points.forEach(add);
     for (const region of scene.regions) region.loops.forEach((loop) => loop.forEach(add));
     for (const list of [scene.edges, scene.hidden, scene.floor]) for (const [p, q] of list) { add(p); add(q); }
+    for (const line of scene.lines || []) for (const part of auxParts(line, scene.palette)) for (const [p, q] of part.segments) { add(p); add(q); }
+    for (const dot of scene.dots || []) { add({ x: dot.x - dot.r, y: dot.y - dot.r }); add({ x: dot.x + dot.r, y: dot.y + dot.r }); }
     for (const dim of scene.dims) {
       rect(dim.hit);
       if (!dim.textStyle) for (const [s, n] of [[dim.da, 7], [dim.db, 7]]) add({ x: s.x + dim.normal[0] * n, y: s.y + dim.normal[1] * n });
@@ -392,6 +450,28 @@
     const bx = tip.x + ux * size, by = tip.y + uy * size, w = size * .36;
     return 'M' + num(tip.x) + ' ' + num(tip.y) + 'L' + num(bx - uy * w) + ' ' + num(by + ux * w) + 'L' + num(bx + uy * w) + ' ' + num(by - ux * w) + 'Z';
   }
+  // Strokes of an auxiliary segment: hidden stretches dashed, the seen ones in its own style,
+  // and slanted ticks at the middle for equal lengths.
+  function auxParts(line, pal) {
+    if (line.style === 'none' && !line.ticks) return [];
+    const parts = [];
+    if (line.style !== 'none') {
+      if (line.hidden.length && line.behind !== 'hide') parts.push({ segments: line.hidden, width: pal.hiddenWidth, dash: pal.dash });
+      if (line.seen.length) parts.push({ segments: line.seen, width: line.style === 'bold' ? pal.boldWidth : pal.auxWidth, dash: line.style === 'dash' ? pal.auxDash : '' });
+    }
+    if (line.ticks) {
+      const [a, b] = line.ends, len = Math.hypot(b.x - a.x, b.y - a.y) || 1, v = [(b.x - a.x) / len, (b.y - a.y) / len], n = [-v[1], v[0]];
+      const q = [n[0] + v[0] * .5, n[1] + v[1] * .5], ql = Math.hypot(...q), mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }, ticks = [];
+      for (let j = 0; j < line.ticks; j++) {
+        const c = { x: mid.x + v[0] * (j - (line.ticks - 1) / 2) * 4, y: mid.y + v[1] * (j - (line.ticks - 1) / 2) * 4 };
+        ticks.push([{ x: c.x - q[0] / ql * 5, y: c.y - q[1] / ql * 5 }, { x: c.x + q[0] / ql * 5, y: c.y + q[1] / ql * 5 }]);
+      }
+      parts.push({ segments: ticks, width: pal.auxWidth, dash: '' });
+    }
+    return parts;
+  }
+  const dotsPath = (dots) => dots.map((p) => 'M' + num(p.x - p.r) + ' ' + num(p.y) + 'a' + num(p.r) + ' ' + num(p.r) + ' 0 1 0 ' + num(2 * p.r) + ' 0a' + num(p.r) + ' ' + num(p.r) + ' 0 1 0 ' + num(-2 * p.r) + ' 0').join('');
+
   function dimensionParts(dim, pal) {
     const lines = [], arrows = [];
     if (!dim.textStyle) {
@@ -427,6 +507,7 @@
     }
     if (scene.hidden.length) out.push('<path d="' + pathOf(scene.hidden) + '" fill="none" stroke="' + pal.hidden + '" stroke-width="' + pal.hiddenWidth + '" stroke-dasharray="' + pal.dash + '"/>');
     if (scene.edges.length) out.push('<path d="' + pathOf(scene.edges) + '" fill="none" stroke="' + pal.edge + '" stroke-width="' + pal.edgeWidth + '" stroke-linecap="round" stroke-linejoin="round"/>');
+    for (const line of scene.lines || []) for (const part of auxParts(line, pal)) out.push('<path d="' + pathOf(part.segments) + '" fill="none" stroke="' + pal.aux + '" stroke-width="' + part.width + '"' + (part.dash ? ' stroke-dasharray="' + part.dash + '"' : ' stroke-linecap="round"') + '/>');
     for (const dim of scene.dims) {
       const { lines, arrows } = dimensionParts(dim, pal);
       if (lines.length) out.push('<path d="' + pathOf(lines) + '" fill="none" stroke="' + pal.dim + '" stroke-width="' + pal.dimWidth + '"' + (pal.dimDash ? ' stroke-dasharray="' + pal.dimDash + '"' : '') + '/>');
@@ -434,7 +515,8 @@
       if (!dim.textStyle) out.push('<rect x="' + num(dim.mx - dim.labelWidth / 2) + '" y="' + num(dim.my - dim.labelHeight / 2) + '" width="' + num(dim.labelWidth) + '" height="' + num(dim.labelHeight) + '" fill="#fff"/>');
       out.push(textSvg(dim.label, dim.mx, dim.my, dim.fontSize, dim.answer ? pal.answer : pal.text, dim.answer ? 700 : 500));
     }
-    for (const l of scene.labels) out.push(textSvg(l.text, l.x, l.y, l.fontSize, pal.text, 700));
+    if (scene.dots?.length) out.push('<path d="' + dotsPath(scene.dots) + '" fill="' + pal.aux + '" stroke="#fff" stroke-width=".6"/>');
+    for (const l of scene.labels) out.push(textSvg(l.text, l.x, l.y, l.fontSize, pal.text, l.weight ?? 700));
     return out.join('') + '</svg>';
   }
   const halo = (size) => num(size * .16 + .8);
@@ -460,9 +542,15 @@
     }
     if (scene.hidden.length) { ctx.setLineDash(pal.dash.split(' ').map(Number)); ctx.strokeStyle = pal.hidden; ctx.lineWidth = pal.hiddenWidth; segments(scene.hidden); ctx.setLineDash([]); }
     if (scene.edges.length) { ctx.lineCap = 'round'; ctx.strokeStyle = pal.edge; ctx.lineWidth = pal.edgeWidth; segments(scene.edges); ctx.lineCap = 'butt'; }
+    for (const line of scene.lines || []) for (const part of auxParts(line, pal)) {
+      ctx.setLineDash(part.dash ? part.dash.split(' ').map(Number) : []); ctx.lineCap = part.dash ? 'butt' : 'round';
+      ctx.strokeStyle = pal.aux; ctx.lineWidth = part.width; segments(part.segments);
+    }
+    ctx.setLineDash([]); ctx.lineCap = 'butt';
     ctx.restore();
     for (const dim of scene.dims) paintDimension(ctx, dim, pal);
-    for (const l of scene.labels) paintText(ctx, l.text, l.x, l.y, l.fontSize, pal.text, 700);
+    if (scene.dots?.length) { ctx.save(); ctx.fillStyle = pal.aux; ctx.strokeStyle = '#fff'; ctx.lineWidth = .6; const path = new Path2D(dotsPath(scene.dots)); ctx.fill(path); ctx.stroke(path); ctx.restore(); }
+    for (const l of scene.labels) paintText(ctx, l.text, l.x, l.y, l.fontSize, pal.text, l.weight ?? 700);
   }
   function paintDimension(ctx, dim, pal, accent) {
     const { lines, arrows } = dimensionParts(dim, pal);
@@ -515,7 +603,7 @@
     if (!box) throw new Error('빈 도형은 그림으로 내보낼 수 없습니다.');
     const { o, settings, view } = exportOptions(p, options);
     const basis = viewBasis(view), geometry = options.geometry || G.extractSurface(p.cells), has = G.occupancy(p.cells);
-    const model = { cells: p.cells, box, geometry, has, unit: p.unit, unitLabel: p.unitLabel, dimensions: p.dimensions, overallDimensions: p.overallDimensions, labels: p.labels, settings };
+    const model = { cells: p.cells, box, geometry, has, unit: p.unit, unitLabel: p.unitLabel, dimensions: p.dimensions, overallDimensions: p.overallDimensions, labels: p.labels, points: p.points, segments: p.segments, settings };
     const fontSize = o.fontSize ?? 14, [ew, eh] = projectedExtent(box, basis);
     const build = (scale) => {
       const frame = makeFrame(basis, scale, box.center);
@@ -578,8 +666,16 @@
     for (let i = 0; i < rects.length; i++) for (let j = i + 1; j < rects.length; j++) {
       if (rectsOverlap(rects[i].hit, rects[j].hit)) warn('label-overlap', '"' + rects[i].text + '"와 "' + rects[j].text + '" 글자가 겹칩니다. offset을 바꾸거나 시점을 바꾸세요.', { ids: [rects[i].id, rects[j].id] });
     }
-    for (const item of [...scene.dims, ...scene.labels]) if (item.onShape) warn('text-on-face', '"' + (item.label ?? item.text) + '" 글자가 도형 면 위에 놓였습니다. 시점이나 offset을 바꾸거나 --dims text를 써 보세요.', { id: item.id });
+    for (const item of [...scene.dims, ...scene.labels]) if (item.onShape) warn('text-on-face', '"' + (item.kind ? item.text : item.label ?? item.text) + '" 글자가 도형 면 위에 놓였습니다. 시점이나 offset을 바꾸거나 --dims text를 써 보세요.', { id: item.id });
     for (const l of p.labels) if (!G.onSurface(has, l.at)) warn('label-off-shape', '꼭짓점 이름 "' + l.text + '"의 위치가 도형에 닿지 않습니다.', { id: l.id, at: l.at });
+    // Points and auxiliary segments: off the solid, or hidden in this view.
+    for (const pt of p.points) {
+      const place = G.pointPlace(has, pt.at), name = '점 ' + pt.id + (pt.label !== undefined ? '("' + pt.label + '")' : '');
+      if (place === 'outside') warn('point-off-shape', name + '의 위치가 도형에 닿지 않는 빈 곳입니다. 좌표를 확인하세요.', { id: pt.id, at: pt.at });
+      else if (pt.visible && (pt.dot || (pt.label !== undefined && settings.labels)) && occluded(pt.at, frame.basis.normal, has, box))
+        warn('point-hidden', name + ': 이 시점에서 ' + (place === 'inside' ? '도형 안쪽에' : '도형 뒤에 가려져') + ' 있습니다. 의도한 것인지 확인하세요(보이는 시점으로 바꾸거나 숨은 모서리 점선을 켜기).', { id: pt.id, at: pt.at, place });
+    }
+    for (const line of scene.lines) if (line.style !== 'none' && !line.seen.length && line.behind === 'hide') warn('segment-hidden', '선분 ' + line.id + ': 이 시점에서 전부 가려져 그림에 나오지 않습니다. behind를 dash로 바꾸거나 시점을 바꾸세요.', { id: line.id });
     const cavity = G.cavityAnalysis(p.cells), components = G.componentCount(p.cells), floating = G.unsupportedBlocks(p.cells);
     if (cavity?.cavityCells) warn('hidden-cavity', '겉에서 보이지 않는 빈 공간이 ' + cavity.cavityCells + '칸 있습니다. surfaceArea에는 안쪽 면도 들어 있고, 바깥 겉넓이는 ' + unitText(cavity.exteriorFaces * p.unit ** 2) + '²입니다.');
     if (components > 1) warn('disconnected', '도형이 서로 떨어진 ' + components + '덩어리입니다.');
@@ -595,13 +691,20 @@
         // Plane figures seen from each side (평면도형): area in unit², perimeter in unit.
         views: views ? Object.fromEntries(['front', 'right', 'top'].map((k) => [k, { area: Number((views.squares[k] * p.unit ** 2).toFixed(6)), perimeter: Number((views.perimeter[k] * p.unit).toFixed(6)) }])) : null,
         shown: [...scene.dims.map((d) => ({ id: d.id, text: d.label, length: Number((G.length(G.sub(d.b, d.a)) * p.unit).toFixed(6)), ...(d.questionMark ? { question: true } : {}), ...(d.answer ? { answer: true } : {}) })),
-          ...scene.labels.map((l) => ({ id: l.id, text: l.text, at: l.at }))],
+          ...scene.labels.map((l) => ({ id: l.id, text: l.text, ...(l.kind ? { kind: l.kind } : {}), ...(l.at ? { at: l.at } : {}) }))],
+        ...(p.points.length ? { points: p.points.map((pt) => ({ id: pt.id, ...(pt.label !== undefined ? { label: pt.label } : {}), at: pt.at, place: G.pointPlace(has, pt.at), dot: pt.dot, visible: pt.visible })) } : {}),
+        // How each auxiliary segment came out in this view: solid, dashed where hidden, or not drawn.
+        ...(scene.lines.length || p.segments.length ? { segments: p.segments.map((s) => {
+          const line = scene.lines.find((l) => l.id === s.id);
+          const drawn = !line ? 'hidden-by-setting' : s.style === 'none' ? 'marks-only' : !line.hidden.length ? 'seen' : !line.seen.length ? (s.behind === 'hide' ? 'not-drawn' : 'dashed') : (s.behind === 'hide' ? 'partly-drawn' : 'partly-dashed');
+          return { id: s.id, length: Number((G.length(G.sub(s.to, s.from)) * p.unit).toFixed(6)), from: s.from, to: s.to, style: s.style, drawn, ...(s.label !== undefined ? { label: s.label } : {}), ...(s.ticks ? { ticks: s.ticks } : {}) };
+        }) } : {}),
         view: r.view, style: settings.style
       }
     };
   }
 
-  const api = { checkProject, format, FONT, PALETTES, VIEWS, viewBasis, corners, projectedExtent, fittingScale, createFrame, makeFrame, floorLines, featureEdge, faceClear, occluded, textWidth, rectsOverlap, dimensionText, dimensionLayout, faceColor, faceFill, buildScene, sceneBounds, sceneToSvg, paintScene, paintDimension, paintText, prepareExport, renderSvg };
+  const api = { checkProject, format, FONT, PALETTES, VIEWS, viewBasis, corners, projectedExtent, fittingScale, createFrame, makeFrame, floorLines, featureEdge, faceClear, occluded, visibleParts, auxParts, textWidth, rectsOverlap, dimensionText, dimensionLayout, faceColor, faceFill, buildScene, sceneBounds, sceneToSvg, paintScene, paintDimension, paintText, prepareExport, renderSvg };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.SolidRender = api;
 })(typeof window !== 'undefined' ? window : globalThis);

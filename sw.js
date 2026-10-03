@@ -1,7 +1,7 @@
 ﻿/* Offline cache for the installed web app. Each release precaches every file at once under a
    new CACHE name (bump it with the version), so a page never mixes files from two releases. */
 'use strict';
-const CACHE = 'solidlab-2.0.2-ai-20260929';
+const CACHE = 'solidlab-2.1.0-marks-20261004';
 const FILES = ['./', './index.html', './app.js', './geometry.js', './render.js', './diagram.js', './diagram-app.js', './pwa.js',
   './manifest.webmanifest', './icons/icon.svg', './icons/icon-192.png', './icons/icon-512.png', './icons/maskable-512.png'];
 
