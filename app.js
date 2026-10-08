@@ -15,7 +15,7 @@
     settings: { ...DEFAULT_SETTINGS },
     view: { yaw: .76, pitch: .53, scale: 18, panX: 0, panY: 0, target: [7, 7.5, 8.5], autoFit: true },
     tool: 'orbit', selection: new Set(), pointMode: false, labelMode: false, segmentMode: false, picks: [], overallOffsets: [46, 46, 46], overallVisible: [true, true, true], overallMeta: [{}, {}, {}], measurementMode: 'each',
-    answers: false
+    answers: false, diceCell: null, netView: false
   };
   let box = G.bounds(state.cells), geometry = G.extractSurface(state.cells), occupied = G.occupancy(state.cells), geometryVersion = 0;
   let frame = null, queued = false, hover = null, pointer = null, spacePressed = false, sceneCache = null;
@@ -54,6 +54,14 @@
     state.points = p.points.map(G.encodePoint); state.segments = p.segments.map(G.encodeSegment);
     state.overallOffsets = p.overallDimensions.map((d) => d.offset); state.overallVisible = p.overallDimensions.map((d) => d.visible);
     state.overallMeta = p.overallDimensions.map(labelMeta);
+    // Dice, floor tiles and asks are kept and shown; they are edited with model-tools.cjs for now.
+    state.dice = p.dice; state.extra = { dice: p.dice.map(G.encodeDice), rules: p.rules, asks: p.asks, tiles: p.tiles, arrows: p.arrows };
+  }
+  // A die whose block was removed in the editor is dropped, so the file stays valid.
+  function extraFields() {
+    const x = state.extra || {}, keep = (state.dice || []).filter((d) => state.cells.has(G.key(d.at))).map((d) => d.id);
+    const dice = (x.dice || []).filter((d) => keep.includes(d.id));
+    return { ...(dice.length ? { dice } : {}), ...Object.fromEntries(['rules', 'asks', 'tiles', 'arrows'].filter((k) => x[k] && x[k].length).map((k) => [k, x[k]])) };
   }
 
   function restore(s) {
@@ -78,6 +86,7 @@
       ...(state.labels.length ? { labels: state.labels.map((l) => ({ id: l.id, at: [...l.at], text: l.text, visible: l.visible !== false })) } : {}),
       ...(state.points.length ? { points: JSON.parse(JSON.stringify(state.points)) } : {}),
       ...(state.segments.length ? { segments: JSON.parse(JSON.stringify(state.segments)) } : {}),
+      ...extraFields(),
       settings: { ...state.settings }, view: { yaw: state.view.yaw, pitch: state.view.pitch, ...(state.view.projection === 'oblique' ? { projection: 'oblique' } : {}) }, measurementMode: state.measurementMode,
       brush: { basis: $('brushBasis').value, size: ['brushX','brushY','brushZ'].map(value), drag: $('dragPaint').checked } };
   }
@@ -269,6 +278,7 @@
     $('modelBadge').textContent = !box ? '빈 도형' : state.cells.size === box.size.reduce((a, b) => a * b, 1) ? '직육면체' : '편집한 도형';
     $('emptyState').hidden = state.cells.size !== 0;
     updateSelection(); updateDimensionList(); requestRender();
+    window.SolidDiceApp?.refresh();
   }
 
   function fitView() {
@@ -323,11 +333,12 @@
   function sceneFor(f, fast) {
     const settings = { ...state.settings, overall: state.settings.overall && !state.selection.size };
     const key = [geometryVersion, fast, f.scale, f.cx, f.cy, f.target.join(), f.basis.normal.join(), state.unit, state.unitLabel, state.answers,
-      JSON.stringify([settings, state.dimensions, state.labels, state.points, state.segments, state.overallVisible, state.overallOffsets, state.overallMeta])].join('|');
+      JSON.stringify([settings, state.dimensions, state.labels, state.points, state.segments, state.overallVisible, state.overallOffsets, state.overallMeta, state.extra])].join('|');
     if (sceneCache?.key === key) return sceneCache.scene;
     const marks = resolvedMarks();
     const scene = R.buildScene({ cells: state.cells, box, geometry, has: occupied, unit: state.unit, unitLabel: state.unitLabel,
-      dimensions: state.dimensions.map((d) => ({ ...d, kind: 'pinned' })), overallDimensions: overallOptions(), labels: state.labels, points: marks.points, segments: marks.segments, settings }, f, { fontSize: 13, fast, answers: state.answers });
+      dimensions: state.dimensions.map((d) => ({ ...d, kind: 'pinned' })), overallDimensions: overallOptions(), labels: state.labels, points: marks.points, segments: marks.segments,
+      dice: (state.dice || []).filter((d) => state.cells.has(G.key(d.at))), tiles: state.extra?.tiles || [], arrows: state.extra?.arrows || [], settings }, f, { fontSize: 13, fast, answers: state.answers });
     sceneCache = { key, scene };
     return scene;
   }
@@ -365,6 +376,7 @@
     context.strokeStyle = '#2b8057'; context.lineWidth = 3;
     for (const e of selectedEdges()) strokeLine(context, f.project(e.a), f.project(e.b));
     drawBoxPreview(context, previewRegion, f, 'remove');
+    if (state.tool === 'dice' && state.diceCell && state.cells.has(G.key(state.diceCell))) drawBoxPreview(context, { start: state.diceCell, size: [1, 1, 1] }, f, 'add');
     if (hover?.region && !pointer?.kind?.startsWith('annotation')) drawBrushPreview(context, hover, f);
     if (state.pointMode && hover?.point) drawPoint(context, f.project(hover.point), 5, '#35765e');
     if (state.segmentMode && state.picks.length && hover?.mark) {
@@ -547,7 +559,8 @@
       orbit: ['왼쪽 드래그로 회전합니다.\n다른 도구에서도 오른쪽 드래그로 회전해요.', '드래그 회전 · 휠 확대 · Space + 드래그 이동'],
       add: ['버튼을 떼면 미리 본 영역을 한 번 더합니다.\n연속으로 쌓으려면 드래그 편집을 켜세요.', '클릭 1회 더하기 · 오른쪽 드래그 회전 · Ctrl+Z 되돌리기'],
       remove: ['버튼을 떼면 미리 본 영역을 한 번 파냅니다.\n깊이 1은 한 층만, 깊이 3은 세 층입니다.', '클릭 1회 파내기 · 오른쪽 드래그 회전 · Ctrl+Z 되돌리기'],
-      measure: ['모서리를 누르거나 드래그해 고릅니다.\nShift를 누르면 기존 선택에 더해져요.', '클릭·드래그 선분 선택 · Shift 추가 선택 · 숫자 더블클릭 수정']
+      measure: ['모서리를 누르거나 드래그해 고릅니다.\nShift를 누르면 기존 선택에 더해져요.', '클릭·드래그 선분 선택 · Shift 추가 선택 · 숫자 더블클릭 수정'],
+      dice: ['블록을 누르면 그 칸을 골라 주사위를 놓거나 고칩니다.\n왼쪽 아래 주사위 칸에서 면을 적어요.', '클릭 칸 고르기 · 오른쪽 드래그 회전 · Ctrl+Z 되돌리기']
     };
     $('toolHelp').textContent = text[tool][0]; $('toolHelp').style.whiteSpace = 'pre-line'; $('canvasHelp').textContent = text[tool][1];
     $('pointHint').style.display = 'none'; $('twoPointBtn').classList.remove('active');
@@ -558,6 +571,10 @@
   const VIEW_TITLES = { iso: '입체 · 정투영', oblique: '겨냥도 · 앞면은 그대로, 깊이는 45°로 반만', front: '앞에서 본 모습 · 평면 투영', right: '옆에서 본 모습 · 평면 투영', top: '위에서 본 모습 · 평면 투영' };
   // Highlight the tab that matches the current view (also after opening a file), or none if free.
   function syncViewTabs() {
+    if (state.netView) {
+      document.querySelectorAll('[data-view]').forEach((el) => el.classList.toggle('active', el.dataset.view === 'net'));
+      $('viewTitle').textContent = '전개도 · 직육면체·정육면체·주사위 하나'; return;
+    }
     const v = state.view, name = v.projection === 'oblique' ? 'oblique'
       : Object.keys(VIEW_TITLES).find((k) => R.VIEWS[k] && Math.abs(R.VIEWS[k][0] - v.yaw) < 1e-6 && Math.abs(R.VIEWS[k][1] - v.pitch) < 1e-6);
     document.querySelectorAll('[data-view]').forEach((el) => el.classList.toggle('active', el.dataset.view === name));
@@ -566,9 +583,11 @@
 
   function setView(name) {
     lastBrushClick = null;
+    state.netView = name === 'net';
+    if (state.netView) { syncViewTabs(); window.SolidDiceApp?.refresh(); return; }
     if (name === 'oblique') state.view.projection = 'oblique';
     else { delete state.view.projection; [state.view.yaw, state.view.pitch] = R.VIEWS[name]; }
-    syncViewTabs();
+    syncViewTabs(); window.SolidDiceApp?.refresh();
     hover = null; fitView(); scheduleSave();
   }
 
@@ -881,6 +900,7 @@
       if (dimension && !dimension.textStyle && !picking) pointer = { kind: 'annotation', start: p, dimension, original: snapshot(), moved: false, id: e.pointerId };
       else if (state.tool === 'orbit') pointer = { kind: 'orbit', start: p, yaw: state.view.yaw, pitch: state.view.pitch, id: e.pointerId };
       else if (state.tool === 'measure') pointer = { kind: picking ? 'point' : 'select', start: p, end: p, shift: e.shiftKey, id: e.pointerId };
+      else if (state.tool === 'dice') { const hit = hitAt(p); state.diceCell = hit ? hit.cell : null; window.SolidDiceApp?.select(state.diceCell); requestRender(); }
       else {
         try {
           const options=brushOptions(), signature=options.basis+':'+options.size.join(',');
@@ -1271,7 +1291,7 @@
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') { e.preventDefault(); redo(); return; }
     if (e.ctrlKey || e.metaKey || e.altKey) return;
     if (e.code === 'Space') { spacePressed = true; e.preventDefault(); }
-    const shortcuts = { v: 'orbit', a: 'add', d: 'remove', m: 'measure' };
+    const shortcuts = { v: 'orbit', a: 'add', d: 'remove', m: 'measure', u: 'dice' };
     if (shortcuts[e.key.toLowerCase()]) setTool(shortcuts[e.key.toLowerCase()]);
     if (e.key === 'Escape') { state.selection.clear(); setTool(state.tool); updateSelection(); previewRegion = null; requestRender(); }
   });
@@ -1330,5 +1350,12 @@
   // The version chip shows which build is running; the installed app also says it is installed.
   if (desktop) { $('appVersion').textContent += ' · 설치판'; $('footerVersion').textContent = $('footerVersion').textContent.replace('설치 없이 HTML 열기', '설치판'); }
   window.SolidLabShell = { desktop, message, download, updateDirty: updateDesktopDirty };
+  window.SolidLabEditor = {
+    // A copy: changing it must not touch the editor state or the undo history.
+    project: () => JSON.parse(JSON.stringify(projectData())), netView: () => state.netView, diceCell: () => state.diceCell, message,
+    setDiceCell(cell) { state.diceCell = cell; requestRender(); },
+    // Validates first, so a bad edit throws and changes nothing.
+    edit(data) { const p = G.validateProject(data); pushHistory(snapshot()); applyProject(p); syncControls(); rebuild(); scheduleSave(); }
+  };
   resizeObserver.observe($('canvasWrap')); syncControls(); rebuild(); updateHistory(); updateBrushControls(); setTool('orbit'); prepareStartup();
 })();

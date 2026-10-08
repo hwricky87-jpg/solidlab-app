@@ -61,7 +61,7 @@
       for (const d of directions) {
         if (cells.has(key(add(p, d.n)))) continue;
         const vertices = d.corners.map((v) => add(p, v));
-        faces.push({ vertices, n: d.n, center: add(p, d.n.map((v) => .5 + v * .5)) });
+        faces.push({ vertices, n: d.n, center: add(p, d.n.map((v) => .5 + v * .5)), cell: p });
         for (let i = 0; i < 4; i++) {
           let a = vertices[i], b = vertices[(i + 1) % 4];
           const axis = a.findIndex((v, j) => v !== b[j]);
@@ -321,6 +321,336 @@
     });
     return { points, segments };
   }
+  // --- Dice: contents on the six faces of a block ---------------------------------------------
+  // A die sits on one block. Directions are names, never vectors written by hand: top (+Z),
+  // bottom, front (+Y, toward the viewer), back, left, right (+X). Each face holds pips (a number),
+  // a text (number, letter or symbol) or nothing, and the direction its "up" points to (letters
+  // and the diagonal of 2, 3 and 6 pips need it). The model stores all six faces as drawn.
+  const DIR_NAMES = ['top', 'bottom', 'front', 'back', 'left', 'right'];
+  const DIR_VEC = { top: [0, 0, 1], bottom: [0, 0, -1], front: [0, 1, 0], back: [0, -1, 0], left: [-1, 0, 0], right: [1, 0, 0] };
+  const OPPOSITE = { top: 'bottom', bottom: 'top', front: 'back', back: 'front', left: 'right', right: 'left' };
+  const DEFAULT_UP = { top: 'back', bottom: 'front', front: 'top', back: 'top', left: 'top', right: 'top' };
+  const DIR_KO = { top: '위', bottom: '아래', front: '앞', back: '뒤', left: '왼', right: '오' };
+  const DIR_ALIASES = { 위: 'top', 윗면: 'top', 아래: 'bottom', 아랫면: 'bottom', 밑면: 'bottom', 바닥: 'bottom', 앞: 'front', 앞면: 'front', 뒤: 'back', 뒷면: 'back',
+    왼: 'left', 왼쪽: 'left', 왼쪽면: 'left', 오: 'right', 오른쪽: 'right', 오른쪽면: 'right' };
+  const dirName = (v) => DIR_NAMES.includes(v) ? v : DIR_ALIASES[v];
+  const dirOf = (v) => DIR_NAMES.find((n) => DIR_VEC[n].every((x, i) => x === v[i]));
+  const MAX_PIPS = 12;
+  // Where the pips sit on a unit face: [u, v] with u to the right and v toward the face's "up".
+  // 2, 3 and 6 are not symmetric, so the face's up decides which diagonal or which way the rows run.
+  const PIPS = (() => {
+    const a = .25, m = .5, b = .75, L = { 1: [[m, m]], 2: [[a, b], [b, a]], 3: [[a, b], [m, m], [b, a]], 4: [[a, a], [a, b], [b, a], [b, b]],
+      5: [[a, a], [a, b], [b, a], [b, b], [m, m]], 6: [[a, a], [a, m], [a, b], [b, a], [b, m], [b, b]] };
+    L[7] = [...L[6], [m, m]]; L[8] = [...L[6], [m, a], [m, b]]; L[9] = [...L[8], [m, m]];
+    const rows = [.18, .34, .5, .66, .82];
+    L[10] = [...rows.map((v) => [a, v]), ...rows.map((v) => [b, v])]; L[11] = [...L[10], [m, m]];
+    L[12] = [.2, .4, .6, .8].flatMap((v) => [[a, v], [m, v], [b, v]]);
+    return L;
+  })();
+  const pipRadius = (n) => n <= 6 ? .09 : n <= 9 ? .075 : .06;
+  const DICE_ID = /^[\p{L}\p{N}_-]{1,30}$/u;
+  const ASK_GOALS = ['value', 'min', 'max', 'values', 'count', 'ways'];
+  const CLASS_NAMES = ['all', 'visible', 'hidden', 'exposed', 'surface', 'touching', 'floor', 'unseen'];
+
+  // Lines drawn on a face or a net cell: [[x, y], [x, y]] in its unit square, x to the right and
+  // y down, as the face is read upright (a net cell: as the paper is printed).
+  function normalizeLines(value, where) {
+    if (!Array.isArray(value) || value.length > 12) invalid(where + '는 선 12개 이하의 목록입니다.');
+    return value.map((l, j) => {
+      if (!Array.isArray(l) || l.length !== 2 || !l.every((q) => Array.isArray(q) && q.length === 2 && q.every((v) => Number.isFinite(v) && v >= 0 && v <= 1))) invalid(where + '[' + j + ']는 [[x,y],[x,y]] (칸 안 0~1, x 오른쪽, y 아래쪽)입니다.');
+      if (l[0][0] === l[1][0] && l[0][1] === l[1][1]) invalid(where + '[' + j + ']의 두 끝이 같습니다.');
+      return l.map((q) => [...q]);
+    });
+  }
+  // One face: null (blank), a number (pips) or a string (text), or {pips|text, up, lines}.
+  function normalizeFace(value, dir, where) {
+    if (value === null) return { kind: 'blank', up: DEFAULT_UP[dir] };
+    let body = value, up = DEFAULT_UP[dir], lines = null;
+    if (typeof value === 'object' && !Array.isArray(value)) {
+      const keys = Object.keys(value).filter((k) => value[k] !== undefined);
+      const bad = keys.filter((k) => !['pips', 'text', 'up', 'lines'].includes(k));
+      if (bad.length) invalid(where + '에 쓸 수 없는 항목: ' + bad.join(', ') + ' (pips, text, up, lines만)');
+      if (value.pips !== undefined && value.text !== undefined) invalid(where + '에는 pips(눈의 수)와 text(글자) 중 하나만 넣습니다.');
+      if (value.lines !== undefined) lines = normalizeLines(value.lines, where + '.lines');
+      if (value.pips === undefined && value.text === undefined && !lines) invalid(where + '에는 pips(눈의 수), text(글자), lines(면 위의 선) 중 하나는 넣습니다. 빈 면은 null입니다.');
+      body = value.pips !== undefined ? value.pips : value.text !== undefined ? value.text : null;
+      if (value.pips !== undefined && typeof value.pips !== 'number') invalid(where + '.pips는 1~' + MAX_PIPS + ' 정수입니다.');
+      if (value.text !== undefined && typeof value.text !== 'string') invalid(where + '.text는 글자입니다. 눈은 pips로 씁니다.');
+      if (value.up !== undefined) {
+        up = dirName(value.up);
+        if (!up) invalid(where + '.up은 내용의 위쪽이 가리키는 방향(top, bottom, front, back, left, right 또는 위·아래·앞·뒤·왼·오)입니다.');
+        if (up === dir || up === OPPOSITE[dir]) invalid(where + '.up은 그 면에 평행한 방향이어야 합니다(' + dir + ' 면에는 ' + DIR_NAMES.filter((n) => n !== dir && n !== OPPOSITE[dir]).join('·') + ').');
+      }
+    }
+    const withLines = (face) => lines && lines.length ? { ...face, lines } : face;
+    if (body === null && lines) return withLines({ kind: 'blank', up });
+    if (typeof body === 'number') {
+      if (!Number.isInteger(body) || body < 1 || body > MAX_PIPS) invalid(where + '의 눈의 수는 1~' + MAX_PIPS + ' 정수입니다. 숫자를 글자로 쓰려면 "12"처럼 따옴표.');
+      return withLines({ kind: 'pips', pips: body, up });
+    }
+    if (typeof body === 'string') {
+      if (!textValue(body) || body.length > 12) invalid(where + '의 글자는 1~12자입니다.');
+      return withLines({ kind: 'text', text: body, up });
+    }
+    return invalid(where + '는 눈의 수(숫자), 글자("ㄱ", "12"), null(빈칸) 또는 {pips|text, up, lines}입니다.');
+  }
+  // The number a face counts as: pips, or a text that is a number ("12"). Letters are NaN.
+  const faceValue = (f) => f.kind === 'pips' ? f.pips : f.kind === 'text' && /^-?\d+(\.\d+)?$/.test(f.text) ? Number(f.text) : NaN;
+  const sameContent = (a, b) => a.kind === b.kind && a.pips === b.pips && a.text === b.text;
+  const faceText = (f) => f.kind === 'pips' ? String(f.pips) : f.kind === 'text' ? f.text : '·';
+  function encodeFace(f, dir) {
+    // Lines turn with the face, so a face with lines always keeps its "up".
+    if (f.lines && f.lines.length) return { ...(f.kind === 'pips' ? { pips: f.pips } : f.kind === 'text' ? { text: f.text } : {}), up: f.up, lines: f.lines.map((l) => l.map((q) => [...q])) };
+    if (f.kind === 'blank') return null;
+    const body = f.kind === 'pips' ? f.pips : f.text;
+    // 1, 4, 5 and 9 pips look the same however they are turned, so their "up" is not written.
+    return f.up === DEFAULT_UP[dir] || (f.kind === 'pips' && [1, 4, 5, 9].includes(f.pips)) ? body : { [f.kind === 'pips' ? 'pips' : 'text']: body, up: f.up };
+  }
+
+  function normalizeFaces(faces, where) {
+    if (!faces || typeof faces !== 'object' || Array.isArray(faces)) invalid(where + '는 여섯 방향 {top, bottom, front, back, left, right}의 면 내용입니다.');
+    const result = {};
+    for (const [k, v] of Object.entries(faces)) {
+      const dir = dirName(k);
+      if (!dir) invalid(where + '의 "' + k + '"는 방향 이름이 아닙니다 (top, bottom, front, back, left, right 또는 위·아래·앞·뒤·왼·오).');
+      if (result[dir]) invalid(where + '에 ' + dir + ' 면이 두 번 있습니다.');
+      result[dir] = normalizeFace(v, dir, where + '.' + dir);
+    }
+    const missing = DIR_NAMES.filter((d) => !result[d]);
+    if (missing.length) invalid(where + '에 ' + missing.join(', ') + ' 면이 없습니다. 빈 면은 null로 씁니다.');
+    return result;
+  }
+
+  function checkExpression(e, where) {
+    if (!e || typeof e !== 'object' || Array.isArray(e)) invalid(where + '는 {sum: 면}, {product: 면}, {pairs: "product"|"sum"}, {face: "A.top"} 중 하나입니다.');
+    const kinds = ['sum', 'product', 'pairs', 'face'].filter((k) => e[k] !== undefined);
+    if (kinds.length !== 1) invalid(where + '에는 sum, product, pairs, face 중 하나만 넣습니다.');
+    if (e.pairs !== undefined && !['product', 'sum'].includes(e.pairs)) invalid(where + '.pairs는 "product"(맞닿은 두 면의 곱을 모두 더함) 또는 "sum"입니다.');
+    if (e.face !== undefined && (typeof e.face !== 'string' || !/^.+\..+$/.test(e.face))) invalid(where + '.face는 "주사위ID.방향"입니다. 예: "A.top"');
+    const selector = (s, w) => {
+      if (typeof s === 'string') { if (!CLASS_NAMES.includes(s) && !dirName(s)) invalid(w + ' "' + s + '"는 면 묶음(' + CLASS_NAMES.join(', ') + ') 또는 방향 이름입니다.'); return; }
+      if (Array.isArray(s)) { s.forEach((r, i) => { if (typeof r !== 'string' || !/^.+\..+$/.test(r)) invalid(w + '[' + i + ']는 "주사위ID.방향"입니다.'); }); return; }
+      if (s && typeof s === 'object' && s.opposite !== undefined && Object.keys(s).length === 1) return selector(s.opposite, w + '.opposite');
+      if (s && typeof s === 'object' && Array.isArray(s.dice) && s.of !== undefined && Object.keys(s).length === 2) return selector(s.of, w + '.of');
+      invalid(w + '는 면 묶음 이름, 방향 이름, ["A.top", …], {opposite: …}, {dice: [ID…], of: …} 중 하나입니다.');
+    };
+    if (e.sum !== undefined) selector(e.sum, where + '.sum');
+    if (e.product !== undefined) selector(e.product, where + '.product');
+  }
+  // A rolling question: which die, and the moves written out, the drawn arrows, or every n-move roll.
+  function checkRoll(r, where) {
+    if (!r || typeof r !== 'object' || Array.isArray(r)) invalid(where + '는 {die, moves | path: "arrows" | all: n} 객체입니다.');
+    const bad = Object.keys(r).filter((k) => !['die', 'moves', 'path', 'all'].includes(k));
+    if (bad.length) invalid(where + '에 쓸 수 없는 항목: ' + bad.join(', ') + ' (die, moves, path, all만 씁니다).');
+    // Which die is checked when solving (like "A.top" in other asks), so a model whose die was
+    // deleted in the app still opens.
+    if (r.die !== undefined && typeof r.die !== 'string') invalid(where + '.die는 주사위 ID입니다.');
+    const movesOk = (m) => (typeof m === 'string' && m.trim() !== '' && m.length <= 400) || (Array.isArray(m) && m.length > 0 && m.length <= 200 && m.every((x) => typeof x === 'string' && x.trim() !== ''));
+    if (r.path !== undefined && (r.moves !== undefined || r.all !== undefined)) invalid(where + '.path는 moves·all과 함께 쓰지 않습니다.');
+    if (r.path === undefined && r.all === undefined && r.moves === undefined) invalid(where + '에는 moves(굴리는 순서 "오 오 앞"), path: "arrows"(그림의 화살표를 따라), all: n(n번 굴리는 모든 경우) 중 하나를 넣습니다.');
+    if (r.path !== undefined && r.path !== 'arrows') invalid(where + '.path는 "arrows"(모델의 화살표를 따라 굴림)입니다.');
+    if (r.moves !== undefined && !movesOk(r.moves)) invalid(where + '.moves는 "오 오 앞"·"right x2, front" 같은 글자나 ["right", "front"] 목록입니다' + (r.all !== undefined ? ' (all과 함께 쓰면 굴릴 수 있는 방향들).' : '.'));
+    if (r.all !== undefined && !(Number.isInteger(r.all) && r.all >= 1 && r.all <= 8)) invalid(where + '.all은 굴리는 횟수 1~8입니다.');
+    return JSON.parse(JSON.stringify(r));
+  }
+  // Rolling questions read one face at the end (or at a step or a numbered floor tile), or add up
+  // one direction over the cells passed. Whether the starting cell counts is never guessed.
+  function checkRollExpression(e, where, all) {
+    if (!e || typeof e !== 'object' || Array.isArray(e)) invalid(where + '는 {face: "top"}(마지막 면), {face: "top", step: 2 | tile: "③"}, {sum: "bottom", start: true|false} 중 하나입니다.');
+    const bad = Object.keys(e).filter((k) => !['face', 'sum', 'step', 'tile', 'start'].includes(k));
+    if (bad.length) invalid(where + '에 쓸 수 없는 항목: ' + bad.join(', ') + ' (굴리기 문제는 face, sum, step, tile, start).');
+    const kinds = ['face', 'sum'].filter((k) => e[k] !== undefined);
+    if (kinds.length !== 1) invalid(where + '에는 face(한 면) 또는 sum(지나는 칸마다 그 면을 더함) 중 하나만 넣습니다.');
+    if (!dirName(e[kinds[0]])) invalid(where + '.' + kinds[0] + '는 방향 이름입니다 (top, bottom, front, back, left, right 또는 위·아래·앞·뒤·왼·오).');
+    if (kinds[0] === 'face') {
+      if (e.start !== undefined) invalid(where + '.start는 sum에만 씁니다.');
+      if (e.step !== undefined && e.tile !== undefined) invalid(where + '에는 step(몇 번 굴린 뒤)과 tile(바닥 칸 글자) 중 하나만 씁니다.');
+      if (e.step !== undefined && !(Number.isInteger(e.step) && e.step >= 0)) invalid(where + '.step은 0(처음) 이상의 정수입니다.');
+      if (e.tile !== undefined && !textValue(e.tile)) invalid(where + '.tile은 tiles에 적은 칸 글자입니다. 예: "③"');
+      if (all && (e.step !== undefined || e.tile !== undefined)) invalid(where + ': 모든 경우(all)를 따질 때는 마지막 면만 물을 수 있습니다.');
+    } else {
+      if (e.step !== undefined || e.tile !== undefined) invalid(where + '.step·tile은 face에만 씁니다.');
+      if (typeof e.start !== 'boolean') invalid(where + '.start를 꼭 적습니다: true(처음 놓인 칸의 면도 셈) 또는 false(굴러간 칸만 셈). 문제의 뜻을 읽고 정하세요.');
+    }
+  }
+
+  // Questions about the block solid itself (쌓기나무), counted on the arrangement as written.
+  // A paint rule is never guessed: the floor faces are painted in some books and not in others.
+  const SOLID_FINDS = ['blocks', 'volume', 'surface', 'exterior', 'touchingPairs', 'touchingFaces', 'floorFaces', 'painted', 'paintedFaces', 'faces', 'edges', 'vertices', 'edgeLength',
+    'cutBlocks', 'wholeBlocks', 'pieces', 'pieceVolume', 'pieceSurface', 'sectionArea', 'sectionSides'];
+  const CUT_FINDS = SOLID_FINDS.slice(13), SIDE_FINDS = ['wholeBlocks', 'pieceVolume', 'pieceSurface'];
+  const pointRef = (r) => (typeof r === 'string' && r.length >= 1 && r.length <= 100) || (Array.isArray(r) && r.length === 3 && r.every((v) => Number.isFinite(v) && Math.abs(v) <= COORD_LIMIT));
+  function checkSolidFind(e, where) {
+    const bad = Object.keys(e).filter((k) => !['solid', 'faces', 'paint', 'plane', 'side'].includes(k));
+    if (bad.length) invalid(where + '에 쓸 수 없는 항목: ' + bad.join(', ') + ' (블록 문제는 solid, faces, paint, 자르기는 plane, side).');
+    if (!SOLID_FINDS.includes(e.solid)) invalid(where + '.solid는 ' + SOLID_FINDS.join(', ') + ' 중 하나입니다.');
+    const cutting = CUT_FINDS.includes(e.solid);
+    if (!cutting && (e.plane !== undefined || e.side !== undefined)) invalid(where + '.plane·side는 자르기 문제(' + CUT_FINDS.join(', ') + ')에만 씁니다.');
+    if (cutting) {
+      const ok = (Array.isArray(e.plane) && e.plane.length === 3 && e.plane.every(pointRef)) || (e.plane && !Array.isArray(e.plane) && typeof e.plane === 'object' && Array.isArray(e.plane.normal) && e.plane.normal.length === 3 && e.plane.normal.every(Number.isFinite) && Number.isFinite(e.plane.d) && Object.keys(e.plane).length === 2);
+      if (!ok) invalid(where + '.plane은 지나는 세 점 ["A", "B", [3,0,1.5]](꼭짓점 이름·점 id·좌표) 또는 {"normal": [a,b,c], "d": d}(ax+by+cz=d)입니다.');
+      if (SIDE_FINDS.includes(e.solid) && !(e.side === 'smaller' || e.side === 'larger' || pointRef(e.side))) invalid(where + '.side를 꼭 적습니다: "smaller"·"larger"(부피가 작은·큰 조각) 또는 그 조각 쪽의 점(꼭짓점 이름·점 id·[x,y,z]).');
+      if (!SIDE_FINDS.includes(e.solid) && e.side !== undefined) invalid(where + '.side는 ' + SIDE_FINDS.join(', ') + '에만 씁니다.');
+    }
+    const painted = e.solid === 'painted' || e.solid === 'paintedFaces';
+    if (e.solid === 'painted' && !(e.faces === 'any' || (Number.isInteger(e.faces) && e.faces >= 0 && e.faces <= 6))) invalid(where + '.faces는 칠해진 면의 수 0~6(정확히 그 수) 또는 "any"(한 면 이상)입니다.');
+    if (e.solid !== 'painted' && e.faces !== undefined) invalid(where + '.faces는 solid: "painted"에만 씁니다.');
+    if (!painted && e.paint !== undefined) invalid(where + '.paint는 painted·paintedFaces에만 씁니다.');
+    if (painted && !(e.paint === 'surface' || e.paint === 'exposed' || (Array.isArray(e.paint) && e.paint.length > 0 && e.paint.length <= 6 && e.paint.every((d) => dirName(d))))) {
+      invalid(where + '.paint를 꼭 적습니다: "surface"(바닥에 닿은 면까지 모든 겉면), "exposed"(바닥에 닿은 면은 빼고), 또는 ["top","front"]처럼 칠한 쪽. 문제의 뜻을 읽고 정하세요.');
+    }
+  }
+
+  // Every arrangement that looks the same: the picture as drawn, or the outlines seen from the
+  // front, side and top. How blocks rest and hold together is never guessed either.
+  const SEARCH_GOALS = ['value', 'min', 'max', 'values', 'count', 'ways'];
+  const VIEW_NAMES = { front: 'front', back: 'front', 앞: 'front', 뒤: 'front', side: 'side', right: 'side', left: 'side', 옆: 'side', 오: 'side', 오른쪽: 'side', 왼: 'side', 왼쪽: 'side', top: 'top', 위: 'top' };
+  function stackGiven(g, where) {
+    if (g === 'picture' || g === 'views') return g;
+    if (Array.isArray(g) && g.length && g.every((v) => VIEW_NAMES[v])) {
+      const set = new Set(g.map((v) => VIEW_NAMES[v]));
+      return ['front', 'side', 'top'].filter((v) => set.has(v));
+    }
+    return invalid(where + '는 "picture"(모델 그림과 같은 그림), "views"(앞·옆·위에서 본 모양이 같음), 또는 ["front", "side"]처럼 주어진 본 모양 목록입니다.');
+  }
+  function stackRules(r, where) {
+    const support = ['floor', 'none'], connect = ['none', 'touch', 'all'], area = ['free', 'box', 'footprint'];
+    if (r && typeof r === 'object' && r.area !== undefined && !area.includes(r.area)) invalid(where + '.area는 "free"(바닥 범위 제한 없음, 기본), "box"(모델의 가로·세로 범위 안), "footprint"(모델을 위에서 본 칸 안)입니다.');
+    if (!r || typeof r !== 'object' || !support.includes(r.support) || !connect.includes(r.connect) || Object.keys(r).some((k) => !['support', 'connect', 'area'].includes(k))) {
+      invalid(where + '를 꼭 적습니다: {"support": "floor"(바닥부터 쌓음) | "none"(떠 있어도 됨), "connect": "none" | "touch"(블록마다 면 하나 이상 맞닿음) | "all"(한 덩어리)}. 문제의 뜻을 읽고 정하세요. 모르면 search 명령으로 조건별 답을 먼저 보세요.');
+    }
+    return { support: r.support, connect: r.connect, ...(r.area && r.area !== 'free' ? { area: r.area } : {}) };
+  }
+
+  // dice, rules, asks, tiles and arrows (all optional). Shorthands (standard dice, nets) belong to
+  // build designs; the model always holds the six faces exactly as drawn.
+  function normalizeDiceFields(data, cells) {
+    const list = (name, max) => {
+      const v = data[name];
+      if (v === undefined) return [];
+      if (!Array.isArray(v) || v.length > max) invalid(name + '는 ' + max + '개 이하의 배열이어야 합니다.');
+      return v;
+    };
+    const dice = [], ids = new Set(), places = new Set();
+    list('dice', 200).forEach((d, index) => {
+      const where = 'dice[' + index + ']';
+      if (!d || typeof d !== 'object' || Array.isArray(d)) invalid(where + '는 {id, at, faces} 객체여야 합니다.');
+      const bad = Object.keys(d).filter((k) => !['id', 'at', 'faces', 'fixed', 'mirror', 'marks', 'answerLines'].includes(k));
+      if (bad.length) invalid(where + '에 쓸 수 없는 항목: ' + bad.join(', ') + '. 표준 주사위·전개도 줄임말은 build 설계에서 씁니다.');
+      const id = d.id ?? 'D' + (index + 1);
+      if (typeof id !== 'string' || !DICE_ID.test(id) || ids.has(id)) invalid(where + '.id는 중복 없는 1~30자 이름입니다.');
+      ids.add(id);
+      if (!isPoint(d.at)) invalid(where + '.at은 블록 칸 [x,y,z] 정수 3개입니다.');
+      if (!cells.has(key(d.at))) invalid(where + '.at ' + JSON.stringify(d.at) + '에 블록이 없습니다 (die-off-block). 주사위는 블록 칸 위에 놓습니다.');
+      if (places.has(key(d.at))) invalid(where + '.at에 이미 다른 주사위가 있습니다.');
+      places.add(key(d.at));
+      const faces = normalizeFaces(d.faces, where + '.faces');
+      let fixed = 'all';
+      if (d.fixed !== undefined) {
+        if (d.fixed === 'all' || d.fixed === 'none') fixed = d.fixed;
+        else if (Array.isArray(d.fixed) && d.fixed.every((x) => dirName(x))) fixed = [...new Set(d.fixed.map(dirName))];
+        else invalid(where + '.fixed는 "all"(그림 그대로), "none"(마음대로 돌림) 또는 고정할 방향 목록 ["top","front"]입니다.');
+      }
+      if (d.mirror !== undefined && typeof d.mirror !== 'boolean') invalid(where + '.mirror는 true(1·2·3이 도는 방향을 모름: 거울 배치도 따짐) 또는 false입니다.');
+      const marks = {};
+      if (d.marks !== undefined) {
+        if (!d.marks || typeof d.marks !== 'object' || Array.isArray(d.marks)) invalid(where + '.marks는 {방향: "㉠"}입니다.');
+        for (const [k, v] of Object.entries(d.marks)) {
+          const dir = dirName(k);
+          if (!dir) invalid(where + '.marks의 "' + k + '"는 방향 이름이 아닙니다.');
+          if (!textValue(v) || v.length > 12) invalid(where + '.marks.' + dir + '는 1~12자 글자입니다. 예: "㉠", "?"');
+          marks[dir] = v;
+        }
+      }
+      if (d.answerLines !== undefined && typeof d.answerLines !== 'boolean') invalid(where + '.answerLines는 true(면 위의 선을 정답용 그림에만 빨갛게 그림) 또는 false입니다.');
+      dice.push({ id, at: [...d.at], faces, fixed, mirror: d.mirror === true, marks, ...(d.answerLines ? { answerLines: true } : {}) });
+    });
+    const rules = list('rules', 50).map((r, index) => {
+      const where = 'rules[' + index + ']';
+      if (!r || typeof r !== 'object') invalid(where + '는 {type: …} 객체입니다.');
+      if (r.type === 'touching-equal') return { type: r.type };
+      if (r.type === 'touching-sum') { if (!Number.isInteger(r.value)) invalid(where + '.value는 맞닿은 두 면의 합(정수)입니다.'); return { type: r.type, value: r.value }; }
+      if (r.type === 'same-orientation') {
+        if (r.dice !== undefined && (!Array.isArray(r.dice) || r.dice.some((x) => !ids.has(x)))) invalid(where + '.dice는 있는 주사위 ID 목록입니다(없으면 모두).');
+        return { type: r.type, ...(r.dice ? { dice: [...r.dice] } : {}) };
+      }
+      if (r.type === 'all-equal' || r.type === 'all-different') {
+        checkExpression({ sum: r.of }, where + '.of');
+        return { type: r.type, of: JSON.parse(JSON.stringify(r.of)) };
+      }
+      return invalid(where + '.type은 touching-equal(맞닿은 면 같은 수), touching-sum(맞닿은 면 합), same-orientation(모두 같은 방향), all-equal·all-different(of로 고른 면이 모두 같은 수·모두 다른 수) 중 하나입니다.');
+    });
+    const askIds = new Set();
+    const asks = list('asks', 50).map((a, index) => {
+      const where = 'asks[' + index + ']';
+      if (!a || typeof a !== 'object' || Array.isArray(a)) invalid(where + '는 {id, find, goal} 객체입니다.');
+      const id = a.id ?? 'q' + (index + 1);
+      if (typeof id !== 'string' || !DICE_ID.test(id) || askIds.has(id)) invalid(where + '.id는 중복 없는 이름입니다.');
+      askIds.add(id);
+      if (a.label !== undefined && !textValue(a.label)) invalid(where + '.label은 1~30자입니다.');
+      if (a.find && typeof a.find === 'object' && !Array.isArray(a.find) && a.find.solid !== undefined) {
+        if (a.roll !== undefined) invalid(where + ': 블록 문제(find.solid)에는 roll을 쓰지 않습니다.');
+        if (a.where !== undefined && !(Array.isArray(a.where) && !a.where.length)) invalid(where + '.where: 블록 문제(find.solid)에는 조건을 붙이지 않습니다.');
+        checkSolidFind(a.find, where + '.find');
+        const goal = a.goal ?? 'value';
+        let search = null;
+        if (a.given !== undefined && CUT_FINDS.includes(a.find.solid)) invalid(where + '.given: 자르기 문제는 적은 모양 하나를 자르므로 given을 쓰지 않습니다.');
+        if (a.given === undefined) {
+          if (goal !== 'value') invalid(where + '.goal: 적은 배치 하나를 그대로 세는 블록 문제에는 goal을 쓰지 않습니다. 그림이나 본 모양이 같은 모든 배치를 따지려면 given과 rules를 함께 씁니다.');
+          if (a.rules !== undefined) invalid(where + '.rules는 given(그림 "picture" 또는 본 모양 "views")과 함께 씁니다.');
+        } else {
+          if (!SEARCH_GOALS.includes(goal)) invalid(where + '.goal은 ' + SEARCH_GOALS.join(', ') + ' 중 하나입니다 (ways = 배치의 가짓수, count = 나올 수 있는 값의 가짓수).');
+          search = { given: stackGiven(a.given, where + '.given'), rules: stackRules(a.rules, where + '.rules') };
+        }
+        const exactText = CUT_FINDS.includes(a.find.solid) && typeof a.answer === 'string' && /^[-+0-9./√\s]+$/.test(a.answer) && /\d/.test(a.answer);
+        const numbers = Number.isFinite(a.answer) || exactText || (goal === 'values' && Array.isArray(a.answer) && a.answer.every(Number.isFinite));
+        if (a.answer !== undefined && !numbers) invalid(where + '.answer는 수입니다' + (goal === 'values' ? '(goal values는 수 목록).' : CUT_FINDS.includes(a.find.solid) ? '(자르기 문제는 "27/2", "9√3/2", "18 + 9√3" 같은 글자도 됨).' : '.'));
+        return { id, find: JSON.parse(JSON.stringify(a.find)), goal, ...(search || {}), where: [], ...(a.answer !== undefined ? { answer: a.answer } : {}), ...(a.label !== undefined ? { label: a.label } : {}) };
+      }
+      const roll = a.roll === undefined ? null : checkRoll(a.roll, where + '.roll');
+      const goal = a.goal ?? 'value';
+      if (!ASK_GOALS.includes(goal)) invalid(where + '.goal은 ' + ASK_GOALS.join(', ') + ' 중 하나입니다.');
+      if (goal === 'ways' && !(roll && roll.all)) invalid(where + '.goal "ways"(경우의 수)는 roll.all(n번 굴리는 모든 경우)과 함께 씁니다.');
+      if (roll && !roll.all && goal !== 'value') invalid(where + ': 정해진 길로 굴리는 문제는 답이 하나라 goal을 쓰지 않습니다(min·max·count는 roll.all일 때).');
+      const expression = roll ? (e, w) => checkRollExpression(e, w, !!roll.all) : checkExpression;
+      if (a.find !== undefined || goal !== 'ways') expression(a.find, where + '.find');
+      const conditions = a.where === undefined ? [] : Array.isArray(a.where) ? a.where : [a.where];
+      conditions.forEach((c, i) => {
+        const w = where + '.where[' + i + ']', { equals, multipleOf, ...expr } = c || {};
+        expression(expr, w);
+        if ((equals === undefined) === (multipleOf === undefined)) invalid(w + '에는 equals(같다) 또는 multipleOf(배수) 중 하나를 넣습니다.');
+        if (equals !== undefined && !Number.isFinite(equals)) invalid(w + '.equals는 수입니다.');
+        if (multipleOf !== undefined && !(Number.isInteger(multipleOf) && multipleOf > 0)) invalid(w + '.multipleOf는 양의 정수입니다.');
+      });
+      // A rolled die may end with a letter on top, so a face asked about a roll can be answered in text.
+      const textAnswer = roll && a.find && a.find.face !== undefined && textValue(a.answer) && a.answer.length <= 12;
+      if (a.answer !== undefined && !textAnswer && !(Number.isFinite(a.answer) || (Array.isArray(a.answer) && a.answer.every(Number.isFinite)))) invalid(where + '.answer는 수(또는 수 목록, goal이 values일 때)입니다' + (roll ? '. 굴린 뒤 면의 글자를 물을 때는 글자 "ㄱ"도 됩니다.' : '.'));
+      return { id, ...(roll ? { roll } : {}), ...(a.find !== undefined ? { find: JSON.parse(JSON.stringify(a.find)) } : {}), goal, where: JSON.parse(JSON.stringify(conditions)), ...(a.answer !== undefined ? { answer: a.answer } : {}), ...(a.label !== undefined ? { label: a.label } : {}) };
+    });
+    const tiles = list('tiles', 400).map((t, index) => {
+      const where = 'tiles[' + index + ']';
+      if (!t || typeof t !== 'object' || !Array.isArray(t.at) || t.at.length !== 2 || !t.at.every((v) => Number.isInteger(v) && Math.abs(v) <= COORD_LIMIT)) invalid(where + '.at은 바닥 칸 [x,y] 정수 2개입니다.');
+      if (t.text !== undefined && (!textValue(t.text) || t.text.length > 12)) invalid(where + '.text는 1~12자입니다. 예: "①"');
+      if (t.shade !== undefined && typeof t.shade !== 'boolean') invalid(where + '.shade는 true 또는 false입니다.');
+      return { at: [...t.at], ...(t.text !== undefined ? { text: t.text } : {}), ...(t.shade ? { shade: true } : {}) };
+    });
+    const arrows = list('arrows', 100).map((a, index) => {
+      const where = 'arrows[' + index + ']';
+      if (!Array.isArray(a) || a.length < 2 || a.length > 100 || !a.every((p) => Array.isArray(p) && p.length === 2 && p.every((v) => Number.isFinite(v) && Math.abs(v) <= COORD_LIMIT))) invalid(where + '는 바닥 칸 [x,y] 2개 이상을 지나는 화살표입니다(칸 가운데를 잇고 끝에 화살촉).');
+      return a.map((p) => [...p]);
+    });
+    return { dice, rules, asks, tiles, arrows };
+  }
+  function encodeDice(d) {
+    return { id: d.id, at: [...d.at], faces: Object.fromEntries(DIR_NAMES.map((n) => [n, encodeFace(d.faces[n], n)])),
+      ...(d.fixed !== 'all' ? { fixed: d.fixed } : {}), ...(d.mirror ? { mirror: true } : {}), ...(Object.keys(d.marks).length ? { marks: { ...d.marks } } : {}), ...(d.answerLines ? { answerLines: true } : {}) };
+  }
+  // Move dice and floor tiles with the cells (resize, box edits).
+  function mapDice(data, map) {
+    const flat = (p) => map([p[0], p[1], 0]).slice(0, 2);
+    return { dice: (data.dice || []).map((d) => ({ ...d, at: map(d.at) })), tiles: (data.tiles || []).map((t) => ({ ...t, at: flat(t.at) })), arrows: (data.arrows || []).map((a) => a.map((p) => map([p[0], p[1], 0]).slice(0, 2))) };
+  }
+
   // Saved form: the definition (at, on or cross), never the derived coordinates.
   const encodePoint = (p) => ({ id: p.id, ...JSON.parse(JSON.stringify(p.def)), ...(p.label !== undefined ? { label: p.label } : {}), dot: p.dot, ...(p.labelAt !== undefined ? { labelAt: p.labelAt } : {}), visible: p.visible });
   const encodeSegment = (s) => ({ id: s.id, a: copyRef(s.a), b: copyRef(s.b), style: s.style, behind: s.behind, ...(s.label !== undefined ? { label: s.label } : {}), ...(s.ticks ? { ticks: s.ticks } : {}), visible: s.visible });
@@ -421,8 +751,9 @@
     if (typeof view !== 'object' || Array.isArray(view)) invalid('view는 {yaw, pitch} 객체여야 합니다.');
     for (const name of ['yaw', 'pitch']) if (view[name] !== undefined && !Number.isFinite(view[name])) invalid('view.' + name + '는 라디안 숫자여야 합니다.');
     if (view.projection !== undefined && !['orthographic', 'oblique'].includes(view.projection)) invalid('view.projection은 "orthographic" 또는 "oblique"(겨냥도)여야 합니다.');
+    const { dice, rules, asks, tiles, arrows } = normalizeDiceFields(data, cells);
     return {
-      cells, unit: data.unit, unitLabel: data.unitLabel ?? 'cm', dimensions, overallDimensions: overall, labels, points, segments, settings,
+      cells, unit: data.unit, unitLabel: data.unitLabel ?? 'cm', dimensions, overallDimensions: overall, labels, points, segments, settings, dice, rules, asks, tiles, arrows,
       view: { yaw: view.yaw ?? .76, pitch: Math.max(-1.55, Math.min(1.5707963, view.pitch ?? .53)), ...(view.projection === 'oblique' ? { projection: 'oblique' } : {}) }
     };
   }
@@ -455,12 +786,18 @@
   function encodeProject(data, legacy = false) {
     const p = validateProject(data), result = { ...data, version: legacy ? 1 : 2 };
     delete result.blocks; delete result.boxes; delete result.labels; delete result.points; delete result.segments;
+    for (const name of ['dice', 'rules', 'asks', 'tiles', 'arrows']) delete result[name];
     Object.assign(result, legacy ? { blocks: [...p.cells].map(point) } : packCells(p.cells));
     result.unitLabel = p.unitLabel;
     result.dimensions = p.dimensions; result.overallDimensions = p.overallDimensions;
     if (p.labels.length) result.labels = p.labels;
     if (p.points.length) result.points = p.points.map(encodePoint);
     if (p.segments.length) result.segments = p.segments.map(encodeSegment);
+    if (p.dice.length) result.dice = p.dice.map(encodeDice);
+    if (p.rules.length) result.rules = p.rules;
+    if (p.asks.length) result.asks = p.asks.map((a) => ({ ...a, ...(a.where.length ? {} : { where: undefined }) }));
+    if (p.tiles.length) result.tiles = p.tiles;
+    if (p.arrows.length) result.arrows = p.arrows;
     result.settings = p.settings; result.view = p.view;
     return result;
   }
@@ -692,7 +1029,8 @@
 
   const api = { MAX_BLOCKS, UNIT_LABELS, key, point, add, sub, mul, dot, length, bounds, cuboid, editRegion, extractSurface, basis, raycast, brushRegion, resizeInterval, validateProject, overallDimensions, describeProject, packCells, encodeProject, stringifyProject,
     occupancy, onSurface, pointPlace, dimensionAttachment, cavityAnalysis, componentCount, unsupportedBlocks, projections, heightmapCells,
-    lineCross, resolveMarks, encodePoint, encodeSegment, mapMarks };
+    lineCross, resolveMarks, encodePoint, encodeSegment, mapMarks,
+    DIR_NAMES, DIR_VEC, OPPOSITE, DEFAULT_UP, DIR_KO, PIPS, pipRadius, dirName, dirOf, normalizeFace, normalizeFaces, normalizeLines, faceValue, sameContent, faceText, encodeFace, encodeDice, mapDice };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.SolidGeometry = api;
 })(typeof window !== 'undefined' ? window : globalThis);

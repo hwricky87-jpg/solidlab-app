@@ -16,6 +16,7 @@
   const unit = (a) => { const n = len(a); return n ? a.map((v) => v / n) : [1, 0]; };
   const add = (a, b) => [a[0] + b[0], a[1] + b[1]];
   const mul = (a, n) => a.map((v) => v * n);
+  const FILLS = ['none', 'light', 'mid', 'dark'];
   const refs = (ids, value, where) => {
     if (!ids.has(value)) fail(where + '는 존재하는 점 ID여야 합니다: ' + value);
     return value;
@@ -122,6 +123,7 @@
         if (!Array.isArray(it.points) || it.points.length < 3 || it.points.length > 100) fail(w + '.points는 3~100개 점 ID여야 합니다.');
         it.points.forEach((id) => refs(ids, id, w + '.points'));
         if (new Set(it.points).size !== it.points.length) fail(w + '.points에 중복이 있습니다.');
+        if (it.stroke !== undefined && typeof it.stroke !== 'boolean') fail(w + '.stroke는 true/false입니다(false면 테두리 없이 칠만 함).');
       } else if (['circle', 'arc', 'sector'].includes(it.type)) {
         refs(ids, it.center, w + '.center');
         if (it.type === 'circle') {
@@ -144,6 +146,11 @@
         if (!['arc', 'right'].includes(it.mark || 'arc')) fail(w + '.mark는 arc 또는 right여야 합니다.');
       } else if (it.type === 'text') {
         if (!(point(it.at) || ids.has(it.at)) || !str(it.text, 100)) fail(w + '에는 점 ID/[x,y]와 1~100자 text가 필요합니다.');
+        if (it.rotate !== undefined && !finite(it.rotate)) fail(w + '.rotate는 글자를 시계 방향으로 돌린 각도(도)입니다. 예: 90');
+        if (it.size !== undefined && it.height !== undefined) fail(w + '에는 size(글자 크기 배수)와 height(그림 단위 글자 높이) 중 하나만 씁니다.');
+        if (it.size !== undefined && !(finite(it.size) && it.size >= .3 && it.size <= 5)) fail(w + '.size는 기본 글자 크기의 배수(0.3~5)입니다.');
+        if (it.height !== undefined && !(finite(it.height) && it.height > 0)) fail(w + '.height는 그림 좌표 단위의 글자 높이(양수)입니다. 예: 전개도 한 칸이 1이면 0.5');
+        if (it.bold !== undefined && typeof it.bold !== 'boolean') fail(w + '.bold는 true/false입니다.');
       } else fail(w + '.type은 segment, line, ray, polygon, circle, ellipse, arc, sector, angle, dim, text 중 하나여야 합니다.');
       if (it.type === 'segment') {
         if (it.ticks !== undefined && ![1, 2, 3].includes(it.ticks)) fail(w + '.ticks는 1~3이어야 합니다.');
@@ -153,7 +160,7 @@
       if (it.type === 'dim' && it.offset !== undefined && (!finite(it.offset) || Math.abs(it.offset) > 300)) fail(w + '.offset은 -300~300 픽셀이어야 합니다.');
       if (it.type === 'dim' && it.style !== undefined && !['line', 'text'].includes(it.style)) fail(w + '.style은 line 또는 text여야 합니다.');
       if (it.type === 'angle' && it.arcs !== undefined && ![1, 2, 3].includes(it.arcs)) fail(w + '.arcs는 1~3이어야 합니다.');
-      if (['polygon', 'circle', 'ellipse', 'sector'].includes(it.type) && it.fill !== undefined && !['none', 'light'].includes(it.fill)) fail(w + '.fill은 none 또는 light여야 합니다.');
+      if (['polygon', 'circle', 'ellipse', 'sector'].includes(it.type) && it.fill !== undefined && !FILLS.includes(it.fill)) fail(w + '.fill은 none, light(옅게), mid(색칠한 면), dark(검게 — 주사위 눈) 중 하나여야 합니다.');
       if (['arc', 'sector'].includes(it.type) && it.ccw !== undefined && typeof it.ccw !== 'boolean') fail(w + '.ccw는 true/false여야 합니다.');
       optionalLabel(it, w);
       return { ...it, id: itemId, ...(Array.isArray(it.points) ? { points: [...it.points] } : {}) };
@@ -240,10 +247,11 @@
     const style = options.style || doc.settings.style;
     if (!['print', 'color'].includes(style)) fail('style은 print 또는 color여야 합니다.');
     const color = style === 'print' ? '#000' : '#34503a', light = style === 'print' ? '#ededed' : '#e3edde';
+    const fillOf = (f) => f === 'light' ? light : f === 'mid' ? (style === 'print' ? '#bdbdbd' : '#b7ceb7') : f === 'dark' ? color : 'none';
     const shapes = [], labels = [], warnings = [], strokes = [];
     const line = (a, b, extra = '') => { shapes.push(`<line x1="${num(a[0])}" y1="${num(a[1])}" x2="${num(b[0])}" y2="${num(b[1])}"${extra}/>`); if (!extra.includes('class="grid"')) strokes.push([a, b]); };
     const path = (d, extra = '') => shapes.push(`<path d="${d}"${extra}/>`);
-    const text = (p, value, extra = '') => labels.push({ p, value: String(value), extra });
+    const text = (p, value, extra = '', box = {}) => labels.push({ p, value: String(value), extra, ...box });
     const P = (id) => toScreen(xy(id));
     const arrow = (tip, toward) => {
       const u = unit(minus(toward, tip)), n = [-u[1], u[0]], base = add(tip, mul(u, 9));
@@ -251,9 +259,12 @@
     };
     const shown = (it, fallback) => it.question ? (options.answers ? (it.value ?? '?') : (it.label ?? '?')) : (it.label ?? it.value ?? fallback);
     const labelWidth = (value, size = fontSize) => [...String(value)].reduce((n, ch) => n + (/[\u1100-\u11ff\u2e80-\uffff]/u.test(ch) ? 1 : .55), 0) * size;
+    // [width, height] of a label on screen: turned and sized texts carry their own box.
+    const boxOf = (l) => l.w !== undefined ? [l.w, l.h] : l.extra.includes('font-size=') ? [labelWidth(l.value, fontSize * 1.12), fontSize * 1.12] : [labelWidth(l.value), fontSize];
     // edge: the cost of reaching past the picture. An automatic export grows to fit its labels, so a
     // length written beside its line may go out there rather than sit on another line.
-    const outside = fixed ? 100 : 3;
+    // Off the canvas costs little while the export can still grow to fit (see the refit below).
+    const outside = fixed ? 100 : .5;
     const labelPenalty = (at, value, size = fontSize, edge = 100) => {
       const tw = labelWidth(value, size);
       let score = at[0] - tw / 2 < 1 || at[0] + tw / 2 > width - 1 || at[1] - size / 2 < 1 || at[1] + size / 2 > height - 1 ? edge : 0;
@@ -311,11 +322,11 @@
           if (it.question && it.value === undefined) warnings.push({ code: 'answer-missing', item: i, message: '문제로 표시한 선분에 정답 value가 없습니다.' });
         }
       } else if (it.type === 'polygon') {
-        const q = it.points.map(P); shapes.push(`<polygon points="${q.map((p) => p.map(num).join(',')).join(' ')}" fill="${it.fill === 'light' ? light : 'none'}"/>`);
-        for (let j = 0; j < q.length; j++) strokes.push([q[j], q[(j + 1) % q.length]]);
+        const q = it.points.map(P); shapes.push(`<polygon points="${q.map((p) => p.map(num).join(',')).join(' ')}" fill="${fillOf(it.fill)}"${it.stroke === false ? ' stroke="none"' : ''}/>`);
+        if (it.stroke !== false) for (let j = 0; j < q.length; j++) strokes.push([q[j], q[(j + 1) % q.length]]);
       } else if (it.type === 'circle') {
         const c = P(it.center), r = (it.r ?? dist(xy(it.center), xy(it.through))) * actualScale;
-        shapes.push(`<circle cx="${c[0]}" cy="${c[1]}" r="${num(r)}" fill="${it.fill === 'light' ? light : 'none'}"/>`);
+        shapes.push(`<circle cx="${c[0]}" cy="${c[1]}" r="${num(r)}" fill="${fillOf(it.fill)}"/>`);
         const around = (j) => add(c, [r * Math.cos(j * Math.PI / 16), r * Math.sin(j * Math.PI / 16)]);
         for (let j = 0; j < 32; j++) strokes.push([around(j), around(j + 1)]); // labels keep clear of the outline
       } else if (it.type === 'arc' || it.type === 'sector') {
@@ -325,7 +336,7 @@
         const ccw = it.ccw !== false, sweep = ccw ? (bc - ac + Math.PI * 2) % (Math.PI * 2) : (ac - bc + Math.PI * 2) % (Math.PI * 2);
         const end = add(c, [r * Math.cos(bc), r * Math.sin(bc)]), start = P(it.from), stop = toScreen(end), center = P(it.center);
         const d = `${it.type === 'sector' ? `M ${center[0]} ${center[1]} L ` : 'M '}${start[0]} ${start[1]} A ${num(r * actualScale)} ${num(r * actualScale)} 0 ${sweep > Math.PI ? 1 : 0} ${ccw ? 0 : 1} ${stop[0]} ${stop[1]}${it.type === 'sector' ? ' Z' : ''}`;
-        path(d, ` fill="${it.fill === 'light' ? light : 'none'}"`);
+        path(d, ` fill="${fillOf(it.fill)}"`);
         const steps = Math.max(2, Math.ceil(sweep / (Math.PI / 16))), turn = (ccw ? 1 : -1) * sweep / steps;
         const along = (j) => toScreen(add(c, [r * Math.cos(ac + turn * j), r * Math.sin(ac + turn * j)]));
         for (let j = 0; j < steps; j++) strokes.push([along(j), along(j + 1)]);
@@ -337,7 +348,7 @@
         // SVG sweep 1 turns clockwise on screen; take the turn that passes over the back point.
         const sweep = cross(minus(start, end), minus(top, end)) > 0 ? 0 : 1;
         const arcTo = (q) => `A ${num(e.rx * actualScale)} ${num(e.ry * actualScale)} ${num(Math.atan2(-e.u[1], e.u[0]) * 180 / Math.PI)} 0 ${sweep} ${q[0]} ${q[1]}`;
-        if (it.fill === 'light') path(`M ${end[0]} ${end[1]} ${arcTo(start)} ${arcTo(end)} Z`, ` fill="${light}" stroke="none"`);
+        if (it.fill && it.fill !== 'none') path(`M ${end[0]} ${end[1]} ${arcTo(start)} ${arcTo(end)} Z`, ` fill="${fillOf(it.fill)}" stroke="none"`);
         if (back !== 'hide') path(`M ${end[0]} ${end[1]} ${arcTo(start)}`, back === 'dash' ? ' stroke-dasharray="4 3"' : '');
         path(`M ${start[0]} ${start[1]} ${arcTo(end)}`);
         // Labels keep clear of the outline too.
@@ -395,7 +406,14 @@
           if (Number.isFinite(stated) && Math.abs(stated - dist(xy(it.a), xy(it.b)) * doc.unit) > .01)
             warnings.push({ code: 'dimension-scale', item: i, message: '실제 비율 도형의 치수 값이 좌표 거리와 다릅니다.' });
         }
-      } else if (it.type === 'text') text(toScreen(xy(it.at)), it.text);
+      } else if (it.type === 'text') {
+        // Turned or sized text (numbers and letters in the cells of a net) keeps its own box.
+        const size = it.height !== undefined ? num(it.height * actualScale) : it.size !== undefined ? num(fontSize * it.size) : null;
+        const at = toScreen(xy(it.at)), turn = ((it.rotate || 0) % 360 + 360) % 360;
+        const extra = (size ? ` font-size="${size}"` : '') + (it.bold ? ' font-weight="700"' : '') + (turn ? ` transform="rotate(${num(turn)} ${at[0]} ${at[1]})"` : '');
+        const w = labelWidth(it.text, size || fontSize), h = size || fontSize, sideways = turn % 180 !== 0;
+        text(at, it.text, extra, size || turn ? { w: turn % 90 ? Math.max(w, h) : sideways ? h : w, h: turn % 90 ? Math.max(w, h) : sideways ? w : h } : {});
+      }
     }
     for (const { it, a, b, symbol } of segmentTexts) {
       const v = unit(minus(b, a)), n = [-v[1], v[0]], middle = mul(add(a, b), .5), c = toScreen(centerFor(it.a, it.b));
@@ -417,7 +435,7 @@
       let best = null;
       candidates: for (const turn of [0, 45, -45, 90, -90, 135, -135, 180]) for (const radius of [15, 21, 27]) {
         const a = angle + turn * Math.PI / 180, at = add(screen, [Math.cos(a) * radius, -Math.sin(a) * radius]);
-        const penalty = labelPenalty(at, p.label, fontSize * 1.12) + radius * .05 + Math.abs(turn) * .005;
+        const penalty = labelPenalty(at, p.label, fontSize * 1.12, typeof p.labelAt === 'number' ? outside : 100) + radius * .05 + Math.abs(turn) * .005;
         if (!best || penalty < best.penalty) best = { at, penalty };
         if (penalty < 2) break candidates;
       }
@@ -431,21 +449,21 @@
         y0 = Math.min(y0, a[1], b[1]); y1 = Math.max(y1, a[1], b[1]);
       }
       for (const l of labels) {
-        const size = l.extra.includes('font-size=') ? fontSize * 1.12 : fontSize, half = labelWidth(l.value, size) / 2 + 2;
+        const [w, h] = boxOf(l), half = w / 2 + 2;
         x0 = Math.min(x0, l.p[0] - half); x1 = Math.max(x1, l.p[0] + half);
-        y0 = Math.min(y0, l.p[1] - size * .65 - 2); y1 = Math.max(y1, l.p[1] + size * .65 + 2);
+        y0 = Math.min(y0, l.p[1] - h * .65 - 2); y1 = Math.max(y1, l.p[1] + h * .65 + 2);
       }
       const grow = [Math.max(0, 6 - x0), Math.max(0, x1 + 6 - width), Math.max(0, 6 - y0), Math.max(0, y1 + 6 - height)];
       if (grow.some((v) => v > .5)) return scene(doc, { ...options, _pads: pads.map((v, i) => v + Math.ceil(grow[i] + 1)), _fitPass: (options._fitPass || 0) + 1 });
     }
     // Warn about label collisions without changing the semantic positions in the document.
     for (let i = 0; i < labels.length; i++) for (let j = i + 1; j < labels.length; j++) {
-      const a = labels[i], b = labels[j], aw = labelWidth(a.value), bw = labelWidth(b.value);
-      if (Math.abs(a.p[0] - b.p[0]) < (aw + bw) / 2 && Math.abs(a.p[1] - b.p[1]) < fontSize) warnings.push({ code: 'label-overlap', labels: [a.value, b.value], message: '그림의 글자가 겹칩니다.' });
+      const a = labels[i], b = labels[j], [aw, ah] = boxOf(a), [bw, bh] = boxOf(b);
+      if (Math.abs(a.p[0] - b.p[0]) < (aw + bw) / 2 && Math.abs(a.p[1] - b.p[1]) < (ah + bh) / 2) warnings.push({ code: 'label-overlap', labels: [a.value, b.value], message: '그림의 글자가 겹칩니다.' });
     }
     for (const l of labels) {
-      const half = labelWidth(l.value) / 2;
-      if (l.p[0] - half < 0 || l.p[0] + half > width || l.p[1] - fontSize * .6 < 0 || l.p[1] + fontSize * .6 > height)
+      const [w, h] = boxOf(l), half = w / 2;
+      if (l.p[0] - half < 0 || l.p[0] + half > width || l.p[1] - h * .6 < 0 || l.p[1] + h * .6 > height)
         warnings.push({ code: 'label-off-canvas', label: l.value, message: '글자가 그림 경계 밖으로 나갑니다. 크기나 이름 위치를 조정하세요.' });
     }
     return { doc, width: num(width), height: num(height), fontSize, color, light, style, shapes, labels, warnings, world, toScreen, toModel };

@@ -4,8 +4,8 @@
   const format = (v) => Number(v.toFixed(5)).toLocaleString('ko-KR', { maximumFractionDigits: 5 });
   const FONT = "'Malgun Gothic','Apple SD Gothic Neo','Noto Sans KR','Segoe UI',sans-serif";
   const PALETTES = {
-    color: { top: '#e3edde', bottom: '#a4bfa8', x: '#cbdbc8', y: '#b7ceb7', edge: '#34503a', edgeWidth: 1.5, grid: '#7d977a', gridWidth: .6, hidden: '#34503a', hiddenWidth: 1, dash: '4 3', floor: '#d9e2d5', dim: '#5f7562', dimWidth: .9, dimDash: '4 3', text: '#243a2a', answer: '#b3261e', arrows: false, aux: '#34503a', auxWidth: 1.3, boldWidth: 2.8, auxDash: '5 3' },
-    print: { top: '#ffffff', bottom: '#b3b3b3', x: '#d4d4d4', y: '#ececec', edge: '#000000', edgeWidth: 1.5, grid: '#000000', gridWidth: .7, hidden: '#000000', hiddenWidth: 1, dash: '4 3', floor: '#cfcfcf', dim: '#000000', dimWidth: .8, dimDash: '', text: '#000000', answer: '#b3261e', arrows: true, aux: '#000000', auxWidth: 1.3, boldWidth: 2.8, auxDash: '5 3' }
+    color: { top: '#e3edde', bottom: '#a4bfa8', x: '#cbdbc8', y: '#b7ceb7', edge: '#34503a', edgeWidth: 1.5, grid: '#7d977a', gridWidth: .6, hidden: '#34503a', hiddenWidth: 1, dash: '4 3', floor: '#d9e2d5', tile: '#cfdccb', dim: '#5f7562', dimWidth: .9, dimDash: '4 3', text: '#243a2a', answer: '#b3261e', arrows: false, aux: '#34503a', auxWidth: 1.3, boldWidth: 2.8, auxDash: '5 3' },
+    print: { top: '#ffffff', bottom: '#b3b3b3', x: '#d4d4d4', y: '#ececec', edge: '#000000', edgeWidth: 1.5, grid: '#000000', gridWidth: .7, hidden: '#000000', hiddenWidth: 1, dash: '4 3', floor: '#cfcfcf', tile: '#c8c8c8', dim: '#000000', dimWidth: .8, dimDash: '', text: '#000000', answer: '#b3261e', arrows: true, aux: '#000000', auxWidth: 1.3, boldWidth: 2.8, auxDash: '5 3' }
   };
   const faceFill = (n, pal) => n[2] > 0 ? pal.top : n[2] < 0 ? pal.bottom : n[0] !== 0 ? pal.x : pal.y;
   const faceColor = (n) => faceFill(n, PALETTES.color);
@@ -128,6 +128,40 @@
     return parts;
   }
 
+  // --- Dice faces and floor tiles ----------------------------------------------------------
+  // What is printed on a face (pips, a number or letter, a mark such as ㉠) is drawn in the face's own
+  // unit square and mapped onto its projected parallelogram with one affine matrix. The square's
+  // right is n × up, which the renderer's views show unmirrored (tested in every view).
+  const cross3 = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+  function decorFrame(center, n, up, f) {
+    const right = cross3(n, up), o = center.map((v, i) => v - right[i] / 2 - up[i] / 2);
+    const O = f.project(o), A = f.project(G.add(o, right)), B = f.project(G.add(o, up));
+    // Local (x, y) with y down, as SVG text expects: screen = O + B + x·(A − O) − y·(B − O).
+    return [A.x - O.x, A.y - O.y, -(B.x - O.x), -(B.y - O.y), B.x, B.y];
+  }
+  function decorContent(content, mark, answer) {
+    if (mark !== null) return { text: mark, answer: false };
+    if (!content || content.kind === 'blank') return null;
+    if (content.kind === 'pips') return { pips: G.PIPS[content.pips].map(([u, v]) => [u, 1 - v]), r: G.pipRadius(content.pips), answer };
+    return { text: content.text, answer };
+  }
+  // Pieces of a seen face of a die, or null. A mark (㉠) replaces the face on the student picture.
+  // Lines on the face are drawn in its own upright frame, already projected to the screen; with
+  // answerLines they are what the student draws, so only the answer picture has them (in red).
+  function dieDecor(die, face, f, answers) {
+    const dir = G.dirOf(face.n), content = die.faces[dir], hasMark = die.marks && die.marks[dir] !== undefined;
+    const body = decorContent(content, hasMark && !answers ? die.marks[dir] : null, hasMark && answers);
+    const showLines = content.lines && (!die.answerLines || answers);
+    if (!body && !showLines) return null;
+    const up = G.DIR_VEC[hasMark && !answers ? G.DEFAULT_UP[dir] : content.up];
+    let lines = null;
+    if (showLines) {
+      const [a, b, c, d, e, g] = decorFrame(face.center, face.n, G.DIR_VEC[content.up], f), at = ([x, y]) => ({ x: a * x + c * y + e, y: b * x + d * y + g });
+      lines = { segments: content.lines.map(([p, q]) => [at(p), at(q)]), answer: !!die.answerLines };
+    }
+    return { ...(body || {}), ...(lines ? { lines } : {}), matrix: decorFrame(face.center, face.n, up, f), id: die.id, dir };
+  }
+
   // --- Text metrics -----------------------------------------------------------------------
   function textWidth(text, size) {
     let w = 0;
@@ -219,11 +253,35 @@
   function buildScene(model, f, options = {}) {
     const settings = model.settings, pal = PALETTES[settings.style] || PALETTES.color;
     const cells = model.cells, box = model.box !== undefined ? model.box : G.bounds(cells);
-    const scene = { palette: pal, gridOn: settings.grid, floor: [], partial: [], regions: [], hidden: [], edges: [], lines: [], dims: [], dots: [], labels: [], fontSize: options.fontSize ?? 13 };
+    const scene = { palette: pal, gridOn: settings.grid, floor: [], tiles: [], arrows: [], partial: [], regions: [], decor: [], decorHidden: [], hidden: [], edges: [], lines: [], dims: [], dots: [], labels: [], fontSize: options.fontSize ?? 13 };
     if (!box) return scene;
     const geometry = model.geometry || G.extractSurface(cells), has = model.has || G.occupancy(cells);
     const d = f.basis.normal, fast = options.fast === true;
     scene.floor = floorLines(box, f, settings.floor);
+    // Floor tiles (굴리기 길) and arrows lie on the floor under the solid, drawn before its faces.
+    const floorZ = box.min[2];
+    for (const t of model.tiles || []) {
+      const [x, y] = t.at, corners = [[x, y], [x + 1, y], [x + 1, y + 1], [x, y + 1]].map(([u, v]) => f.project([u, v, floorZ]));
+      const body = t.text !== undefined ? { text: t.text, answer: false, matrix: decorFrame([x + .5, y + .5, floorZ], [0, 0, 1], [0, -1, 0], f) } : null;
+      scene.tiles.push({ points: corners, shade: !!t.shade, decor: body });
+    }
+    // Between numbered tiles an arrow hops from cell to cell above the floor (as in textbooks), so
+    // it never runs over the numbers; otherwise it is one line through the cell centres.
+    const numbered = new Set((model.tiles || []).filter((t) => t.text !== undefined).map((t) => t.at.join(',')));
+    for (const a of model.arrows || []) {
+      if (!a.some((p) => numbered.has(p.join(',')))) { scene.arrows.push({ line: a.map(([x, y]) => f.project([x + .5, y + .5, floorZ])) }); continue; }
+      const hops = [];
+      for (let i = 0; i + 1 < a.length; i++) {
+        const c = (p) => [p[0] + .5, p[1] + .5, floorZ], p0 = c(a[i]), p1 = c(a[i + 1]), at = (t, lift) => p0.map((v, k) => v + (p1[k] - v) * t + (k === 2 ? lift : 0));
+        hops.push([f.project(at(.28, .05)), f.project(at(.5, .5)), f.project(at(.72, .05))]);
+      }
+      scene.arrows.push({ hops });
+    }
+    const diceAt = new Map((model.dice || []).map((die) => [G.key(die.at), die]));
+    const decorOf = (face) => {
+      const die = face.cell && diceAt.get(G.key(face.cell));
+      return die ? dieDecor(die, face, f, options.answers === true) : null;
+    };
 
     const front = geometry.faces.filter((face) => G.dot(face.n, d) > 1e-6);
     const clear = new Set(), partial = [], planes = new Map();
@@ -239,11 +297,23 @@
           const ax = a.findIndex((v, j) => v !== b[j]); if (a[ax] > b[ax]) [a, b] = [b, a];
           clear.add(G.key(a) + ':' + G.key(b));
         }
+        const decor = diceAt.size && decorOf(face);
+        if (decor) scene.decor.push(decor);
       } else partial.push(face);
     }
     // Painter's order for faces that something may cover; the depth sort is exact for unit faces.
     partial.sort((a, b) => G.dot(G.sub(a.center, f.target), d) - G.dot(G.sub(b.center, f.target), d) || a.center[0] - b.center[0] || a.center[1] - b.center[1] || a.center[2] - b.center[2] || a.n[0] - b.n[0] || a.n[1] - b.n[1]);
-    scene.partial = partial.map((face) => ({ points: face.vertices.map(f.project), fill: faceFill(face.n, pal) }));
+    scene.partial = partial.map((face) => {
+      const decor = diceAt.size && decorOf(face);
+      if (decor && !fast) {
+        // A printed face that something covers in part is worth a look (it may hide a number).
+        const [a, b] = [0, 1, 2].filter((i) => face.n[i] === 0).map((i) => { const v = [0, 0, 0]; v[i] = 1; return v; });
+        let seen = 0;
+        for (const s of [-.4, 0, .4]) for (const t of [-.4, 0, .4]) if (!occluded(face.center.map((v, i) => v + a[i] * s + b[i] * t), d, has, box)) seen++;
+        if (seen < 9) scene.decorHidden.push({ id: decor.id, dir: decor.dir, seen });
+      }
+      return { points: face.vertices.map(f.project), fill: faceFill(face.n, pal), ...(decor ? { decor } : {}) };
+    });
 
     // Fully visible faces never overlap each other, so each plane becomes one outlined region.
     for (const plane of planes.values()) {
@@ -428,6 +498,8 @@
     const add = (p) => { if (p.x < b.x0) b.x0 = p.x; if (p.x > b.x1) b.x1 = p.x; if (p.y < b.y0) b.y0 = p.y; if (p.y > b.y1) b.y1 = p.y; };
     const rect = (r) => { add({ x: r.x, y: r.y }); add({ x: r.x + r.w, y: r.y + r.h }); };
     for (const face of scene.partial) face.points.forEach(add);
+    for (const tile of scene.tiles || []) tile.points.forEach(add);
+    for (const a of scene.arrows || []) (a.line || a.hops.flat()).forEach(add);
     for (const region of scene.regions) region.loops.forEach((loop) => loop.forEach(add));
     for (const list of [scene.edges, scene.hidden, scene.floor]) for (const [p, q] of list) { add(p); add(q); }
     for (const line of scene.lines || []) for (const part of auxParts(line, scene.palette)) for (const [p, q] of part.segments) { add(p); add(q); }
@@ -493,18 +565,37 @@
     if (options.background !== 'none') out.push('<rect x="' + vx + '" y="' + vy + '" width="' + vw + '" height="' + vh + '" fill="#fff"/>');
     if (scene.floor.length) out.push('<path d="' + pathOf(scene.floor) + '" fill="none" stroke="' + pal.floor + '" stroke-width=".7"/>');
     const grid = scene.gridOn;
-    // Partial faces in painter's order; with the grid off, same-coloured runs share one path.
+    for (const tile of scene.tiles || []) {
+      out.push('<path d="' + ringOf(tile.points) + '" fill="' + (tile.shade ? pal.tile : '#fff') + '" stroke="' + pal.edge + '" stroke-width=".8" stroke-linejoin="round"/>');
+      if (tile.decor) out.push(decorSvg(tile.decor, pal));
+    }
+    for (const a of scene.arrows || []) {
+      if (a.line) {
+        out.push('<path d="M' + a.line.map((p) => num(p.x) + ' ' + num(p.y)).join('L') + '" fill="none" stroke="' + pal.edge + '" stroke-width="1.2" stroke-linejoin="round"/>');
+        out.push('<path d="' + arrowPath(a.line[a.line.length - 1], a.line[a.line.length - 2], 7) + '" fill="' + pal.edge + '"/>');
+        continue;
+      }
+      out.push('<path d="' + a.hops.map(([p, q, r]) => 'M' + num(p.x) + ' ' + num(p.y) + 'Q' + num(q.x) + ' ' + num(q.y) + ' ' + num(r.x) + ' ' + num(r.y)).join('') + '" fill="none" stroke="' + pal.edge + '" stroke-width="1.1"/>');
+      out.push('<path d="' + a.hops.map(([, q, r]) => arrowPath(r, q, 6)).join('') + '" fill="' + pal.edge + '"/>');
+    }
+    // Partial faces in painter's order; with the grid off, same-coloured runs share one path. A face
+    // with print on it is drawn on its own, followed by its print, so nearer faces still cover both.
     for (let i = 0; i < scene.partial.length;) {
       const fill = scene.partial[i].fill;
-      if (grid) { out.push('<path d="' + ringOf(scene.partial[i].points) + '" fill="' + fill + '" stroke="' + pal.grid + '" stroke-width="' + pal.gridWidth + '" stroke-linejoin="round"/>'); i++; continue; }
+      if (grid || scene.partial[i].decor) {
+        out.push('<path d="' + ringOf(scene.partial[i].points) + '" fill="' + fill + '" stroke="' + (grid ? pal.grid : fill) + '" stroke-width="' + (grid ? pal.gridWidth : .8) + '" stroke-linejoin="round"/>');
+        if (scene.partial[i].decor) out.push(decorSvg(scene.partial[i].decor, pal));
+        i++; continue;
+      }
       let d = '';
-      while (i < scene.partial.length && scene.partial[i].fill === fill) d += ringOf(scene.partial[i++].points);
+      while (i < scene.partial.length && scene.partial[i].fill === fill && !scene.partial[i].decor) d += ringOf(scene.partial[i++].points);
       out.push('<path d="' + d + '" fill="' + fill + '" stroke="' + fill + '" stroke-width=".8" stroke-linejoin="round"/>');
     }
     for (const region of scene.regions) {
       out.push('<path d="' + region.loops.map(ringOf).join('') + '" fill="' + region.fill + '" stroke="' + (grid ? pal.grid : region.fill) + '" stroke-width="' + (grid ? pal.gridWidth : .8) + '" stroke-linejoin="round"/>');
       if (region.grid.length) out.push('<path d="' + pathOf(region.grid) + '" fill="none" stroke="' + pal.grid + '" stroke-width="' + pal.gridWidth + '"/>');
     }
+    for (const decor of scene.decor || []) out.push(decorSvg(decor, pal));
     if (scene.hidden.length) out.push('<path d="' + pathOf(scene.hidden) + '" fill="none" stroke="' + pal.hidden + '" stroke-width="' + pal.hiddenWidth + '" stroke-dasharray="' + pal.dash + '"/>');
     if (scene.edges.length) out.push('<path d="' + pathOf(scene.edges) + '" fill="none" stroke="' + pal.edge + '" stroke-width="' + pal.edgeWidth + '" stroke-linecap="round" stroke-linejoin="round"/>');
     for (const line of scene.lines || []) for (const part of auxParts(line, pal)) out.push('<path d="' + pathOf(part.segments) + '" fill="none" stroke="' + pal.aux + '" stroke-width="' + part.width + '"' + (part.dash ? ' stroke-dasharray="' + part.dash + '"' : ' stroke-linecap="round"') + '/>');
@@ -520,6 +611,33 @@
     return out.join('') + '</svg>';
   }
   const halo = (size) => num(size * .16 + .8);
+  // Print on a face, in the face's unit square (see decorFrame).
+  const r3 = (v) => { const r = Math.round(v * 1000) / 1000; return Object.is(r, -0) ? 0 : r; };
+  function decorSvg(dc, pal) {
+    const open = '<g transform="matrix(' + dc.matrix.map(r3).join(' ') + ')">';
+    let out = '';
+    if (dc.pips) out = open + '<path d="' + dc.pips.map(([x, y]) => 'M' + r3(x - dc.r) + ' ' + r3(y) + 'a' + dc.r + ' ' + dc.r + ' 0 1 0 ' + r3(2 * dc.r) + ' 0a' + dc.r + ' ' + dc.r + ' 0 1 0 ' + r3(-2 * dc.r) + ' 0').join('') + '" fill="' + (dc.answer ? pal.answer : pal.text) + '"/></g>';
+    else if (dc.text !== undefined) {
+      const n = [...dc.text].length, size = n === 1 ? .62 : n === 2 ? .46 : .34;
+      out = open + '<text x=".5" y="' + r3(.5 + size * .36) + '" text-anchor="middle" font-size="' + size + '" font-weight="' + (dc.answer ? 700 : 600) + '" fill="' + (dc.answer ? pal.answer : pal.text) + '">' + esc(dc.text) + '</text></g>';
+    }
+    if (dc.lines) out += '<path d="' + pathOf(dc.lines.segments) + '" fill="none" stroke="' + (dc.lines.answer ? pal.answer : pal.aux) + '" stroke-width="' + pal.auxWidth + '" stroke-linecap="round"/>';
+    return out;
+  }
+  function paintDecor(ctx, dc, pal) {
+    ctx.save(); ctx.transform(...dc.matrix); ctx.fillStyle = dc.answer ? pal.answer : pal.text;
+    if (dc.pips) { ctx.beginPath(); for (const [x, y] of dc.pips) { ctx.moveTo(x + dc.r, y); ctx.arc(x, y, dc.r, 0, Math.PI * 2); } ctx.fill(); }
+    else if (dc.text !== undefined) {
+      const n = [...dc.text].length, size = n === 1 ? .62 : n === 2 ? .46 : .34;
+      ctx.font = (dc.answer ? 700 : 600) + ' ' + size + 'px ' + FONT; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic'; ctx.fillText(dc.text, .5, .5 + size * .36);
+    }
+    ctx.restore();
+    if (dc.lines) {
+      ctx.save(); ctx.strokeStyle = dc.lines.answer ? pal.answer : pal.aux; ctx.lineWidth = pal.auxWidth; ctx.lineCap = 'round'; ctx.beginPath();
+      for (const [a, b] of dc.lines.segments) { ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); }
+      ctx.stroke(); ctx.restore();
+    }
+  }
   function textSvg(text, x, y, size, fill, weight) {
     return '<text x="' + num(x) + '" y="' + num(y + size * .36) + '" text-anchor="middle" font-size="' + size + '" font-weight="' + weight + '" fill="' + fill + '" stroke="#fff" stroke-width="' + halo(size) + '" stroke-linejoin="round" paint-order="stroke">' + esc(text) + '</text>';
   }
@@ -531,15 +649,27 @@
     const segments = (list) => { ctx.beginPath(); for (const [a, b] of list) { ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); } ctx.stroke(); };
     ctx.save(); ctx.lineJoin = 'round';
     if (scene.floor.length) { ctx.strokeStyle = pal.floor; ctx.lineWidth = .7; segments(scene.floor); }
+    for (const tile of scene.tiles || []) {
+      ctx.beginPath(); poly(tile.points); ctx.fillStyle = tile.shade ? pal.tile : '#fff'; ctx.fill(); ctx.strokeStyle = pal.edge; ctx.lineWidth = .8; ctx.stroke();
+      if (tile.decor) paintDecor(ctx, tile.decor, pal);
+    }
+    for (const a of scene.arrows || []) {
+      ctx.strokeStyle = pal.edge; ctx.fillStyle = pal.edge;
+      if (a.line) { ctx.lineWidth = 1.2; ctx.beginPath(); ctx.moveTo(a.line[0].x, a.line[0].y); for (const p of a.line.slice(1)) ctx.lineTo(p.x, p.y); ctx.stroke(); ctx.fill(new Path2D(arrowPath(a.line[a.line.length - 1], a.line[a.line.length - 2], 7))); continue; }
+      ctx.lineWidth = 1.1;
+      for (const [p, q, r] of a.hops) { ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.quadraticCurveTo(q.x, q.y, r.x, r.y); ctx.stroke(); ctx.fill(new Path2D(arrowPath(r, q, 6))); }
+    }
     for (const face of scene.partial) {
       ctx.beginPath(); poly(face.points); ctx.fillStyle = face.fill; ctx.fill();
       ctx.strokeStyle = grid ? pal.grid : face.fill; ctx.lineWidth = grid ? pal.gridWidth : .8; ctx.stroke();
+      if (face.decor) paintDecor(ctx, face.decor, pal);
     }
     for (const region of scene.regions) {
       ctx.beginPath(); region.loops.forEach(poly); ctx.fillStyle = region.fill; ctx.fill('nonzero');
       ctx.strokeStyle = grid ? pal.grid : region.fill; ctx.lineWidth = grid ? pal.gridWidth : .8; ctx.stroke();
       if (region.grid.length) { ctx.strokeStyle = pal.grid; ctx.lineWidth = pal.gridWidth; segments(region.grid); }
     }
+    for (const decor of scene.decor || []) paintDecor(ctx, decor, pal);
     if (scene.hidden.length) { ctx.setLineDash(pal.dash.split(' ').map(Number)); ctx.strokeStyle = pal.hidden; ctx.lineWidth = pal.hiddenWidth; segments(scene.hidden); ctx.setLineDash([]); }
     if (scene.edges.length) { ctx.lineCap = 'round'; ctx.strokeStyle = pal.edge; ctx.lineWidth = pal.edgeWidth; segments(scene.edges); ctx.lineCap = 'butt'; }
     for (const line of scene.lines || []) for (const part of auxParts(line, pal)) {
@@ -603,7 +733,7 @@
     if (!box) throw new Error('빈 도형은 그림으로 내보낼 수 없습니다.');
     const { o, settings, view } = exportOptions(p, options);
     const basis = viewBasis(view), geometry = options.geometry || G.extractSurface(p.cells), has = G.occupancy(p.cells);
-    const model = { cells: p.cells, box, geometry, has, unit: p.unit, unitLabel: p.unitLabel, dimensions: p.dimensions, overallDimensions: p.overallDimensions, labels: p.labels, points: p.points, segments: p.segments, settings };
+    const model = { cells: p.cells, box, geometry, has, unit: p.unit, unitLabel: p.unitLabel, dimensions: p.dimensions, overallDimensions: p.overallDimensions, labels: p.labels, points: p.points, segments: p.segments, dice: p.dice, tiles: p.tiles, arrows: p.arrows, settings };
     const fontSize = o.fontSize ?? 14, [ew, eh] = projectedExtent(box, basis);
     const build = (scale) => {
       const frame = makeFrame(basis, scale, box.center);
@@ -675,6 +805,18 @@
       else if (pt.visible && (pt.dot || (pt.label !== undefined && settings.labels)) && occluded(pt.at, frame.basis.normal, has, box))
         warn('point-hidden', name + ': 이 시점에서 ' + (place === 'inside' ? '도형 안쪽에' : '도형 뒤에 가려져') + ' 있습니다. 의도한 것인지 확인하세요(보이는 시점으로 바꾸거나 숨은 모서리 점선을 켜기).', { id: pt.id, at: pt.at, place });
     }
+    for (const h of scene.decorHidden || []) if (h.seen > 0) warn('decor-partly-hidden', '주사위 ' + h.id + '의 ' + G.DIR_KO[h.dir] + '면 내용이 이 시점에서 일부 가려집니다. 그림에서 읽을 수 있는지 확인하세요.', { id: h.id, dir: h.dir });
+    // Lines on a die face that this view cannot show at all (behind, underneath or against a block).
+    for (const die of p.dice || []) for (const dir of G.DIR_NAMES) {
+      if (!die.faces[dir].lines) continue;
+      const n = G.DIR_VEC[dir], nb = G.add(die.at, n);
+      let seen = 0;
+      if (!has(nb[0], nb[1], nb[2]) && G.dot(n, frame.basis.normal) > 1e-9) {
+        const [a, b] = [0, 1, 2].filter((i) => n[i] === 0).map((i) => { const v = [0, 0, 0]; v[i] = 1; return v; });
+        for (const s of [-.4, 0, .4]) for (const t of [-.4, 0, .4]) if (!occluded(die.at.map((v, i) => v + .5 + n[i] * .5 + a[i] * s + b[i] * t), frame.basis.normal, has, box)) seen++;
+      }
+      if (!seen) warn('lines-hidden', '주사위 ' + die.id + '의 ' + G.DIR_KO[dir] + '면에 그은 선이 이 시점에서 보이지 않습니다. 그림에 선이 나와야 하면 시점(view)이나 놓는 방향(pose)을 바꾸세요.', { id: die.id, dir });
+    }
     for (const line of scene.lines) if (line.style !== 'none' && !line.seen.length && line.behind === 'hide') warn('segment-hidden', '선분 ' + line.id + ': 이 시점에서 전부 가려져 그림에 나오지 않습니다. behind를 dash로 바꾸거나 시점을 바꾸세요.', { id: line.id });
     const cavity = G.cavityAnalysis(p.cells), components = G.componentCount(p.cells), floating = G.unsupportedBlocks(p.cells);
     if (cavity?.cavityCells) warn('hidden-cavity', '겉에서 보이지 않는 빈 공간이 ' + cavity.cavityCells + '칸 있습니다. surfaceArea에는 안쪽 면도 들어 있고, 바깥 겉넓이는 ' + unitText(cavity.exteriorFaces * p.unit ** 2) + '²입니다.');
@@ -704,7 +846,7 @@
     };
   }
 
-  const api = { checkProject, format, FONT, PALETTES, VIEWS, viewBasis, corners, projectedExtent, fittingScale, createFrame, makeFrame, floorLines, featureEdge, faceClear, occluded, visibleParts, auxParts, textWidth, rectsOverlap, dimensionText, dimensionLayout, faceColor, faceFill, buildScene, sceneBounds, sceneToSvg, paintScene, paintDimension, paintText, prepareExport, renderSvg };
+  const api = { checkProject, format, FONT, PALETTES, VIEWS, viewBasis, decorFrame, dieDecor, decorSvg, corners, projectedExtent, fittingScale, createFrame, makeFrame, floorLines, featureEdge, faceClear, occluded, visibleParts, auxParts, textWidth, rectsOverlap, dimensionText, dimensionLayout, faceColor, faceFill, buildScene, sceneBounds, sceneToSvg, paintScene, paintDimension, paintText, prepareExport, renderSvg };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.SolidRender = api;
 })(typeof window !== 'undefined' ? window : globalThis);
